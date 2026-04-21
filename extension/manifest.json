@@ -1,0 +1,33 @@
+{
+  "manifest_version": 3,
+  "name": "Twitter Memory (local)",
+  "version": "0.1.0",
+  "description": "Local-first capture of your Twitter/X activity. Data stays on your machine.",
+  "permissions": ["storage", "scripting", "tabs", "alarms", "cookies"],
+  "host_permissions": [
+    "https://twitter.com/*",
+    "https://x.com/*",
+    "http://127.0.0.1:8765/*"
+  ],
+  "background": {
+    "service_worker": "service-worker.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://twitter.com/*", "https://x.com/*"],
+      "js": ["content-script.js"],
+      "run_at": "document_start"
+    },
+    {
+      "matches": ["https://twitter.com/*", "https://x.com/*"],
+      "js": ["injected.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Twitter Memory"
+  }
+}

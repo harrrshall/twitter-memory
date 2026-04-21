@@ -1,0 +1,116 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <style>
+      body {
+        font: 13px -apple-system, system-ui, sans-serif;
+        width: 280px;
+        padding: 10px;
+      }
+      h3 {
+        margin: 0 0 8px;
+        font-size: 13px;
+      }
+      .row {
+        display: flex;
+        justify-content: space-between;
+        margin: 4px 0;
+      }
+      .label {
+        color: #555;
+      }
+      .status-ok {
+        color: #0a7d0a;
+      }
+      .status-bad {
+        color: #a60000;
+      }
+      .status-check {
+        color: #777;
+      }
+      .hint {
+        margin-top: 6px;
+        padding: 6px 8px;
+        background: #faf0f0;
+        border-left: 3px solid #a60000;
+        color: #5a2b2b;
+        font-size: 11px;
+        line-height: 1.4;
+        display: none;
+      }
+      .hint code {
+        font: 11px ui-monospace, SFMono-Regular, Menlo, monospace;
+        background: #f3e0e0;
+        padding: 0 3px;
+        border-radius: 2px;
+      }
+      .path {
+        font: 10px ui-monospace, SFMono-Regular, Menlo, monospace;
+        color: #666;
+        word-break: break-all;
+      }
+      button {
+        width: 100%;
+        padding: 6px;
+        margin-top: 8px;
+      }
+    </style>
+  </head>
+  <body>
+    <h3>Twitter Memory</h3>
+    <div class="row">
+      <span class="label">Backend</span>
+      <span id="backend" class="status-check">checking…</span>
+    </div>
+    <div class="row">
+      <span class="label">Tweets today</span>
+      <span id="tweets">—</span>
+    </div>
+    <div class="row">
+      <span class="label">Sessions today</span>
+      <span id="sessions">—</span>
+    </div>
+    <div class="row">
+      <span class="label">Time today</span>
+      <span id="dwell">—</span>
+    </div>
+    <div class="row">
+      <span class="label">Data folder</span>
+      <span id="data-dir" class="path">—</span>
+    </div>
+    <div id="hint" class="hint">
+      Start the backend:
+      <code>.venv/bin/python -m backend.main</code>
+    </div>
+    <button id="export">Export today</button>
+    <div id="export-status" class="path" style="margin-top: 4px; min-height: 1em"></div>
+    <button id="toggle">Toggle capture</button>
+    <div class="row">
+      <span class="label">Capture</span>
+      <span id="cap">…</span>
+    </div>
+
+    <hr style="margin: 10px 0; border: 0; border-top: 1px solid #eee" />
+    <div class="row">
+      <span class="label">Enrichment</span>
+      <span id="enrich-state">off</span>
+    </div>
+    <div class="row" style="font-size: 11px; color: #777">
+      <span>Missing tweet text</span>
+      <span id="dq-stubs">—</span>
+    </div>
+    <div class="row" style="font-size: 11px; color: #777">
+      <span>Queued to enrich</span>
+      <span id="dq-queue">—</span>
+    </div>
+    <div class="row" style="font-size: 11px; color: #777">
+      <span>Templates captured</span>
+      <span id="dq-templates">—</span>
+    </div>
+    <button id="toggle-enrich">Toggle enrichment</button>
+    <button id="force-enrich" style="margin-top: 4px">Force backfill now</button>
+    <div id="enrich-status" class="path" style="margin-top: 4px; min-height: 1em"></div>
+    <script src="popup.js"></script>
+  </body>
+</html>
