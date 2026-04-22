@@ -12,17 +12,22 @@ EXPORTS_DIR = DATA_DIR / "exports"
 INLINE_CONTENT_CAP_BYTES = 200_000
 
 ALL_SECTIONS = [
+    "tldr",
     "summary",
     "sessions",
+    "tweets_ranked",
+    "repeat_exposure",
+    "topics",
     "searches",
     "interactions",
     "link_outs",
     "selections",
     "media",
-    "top_authors",
+    "authors",
     "threads",
     "timeline",
     "impressions",
+    "schema",
 ]
 
 
