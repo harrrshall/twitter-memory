@@ -18,6 +18,13 @@ RETENTION_TABLES = {
     "sessions": ("ended_at", 60),
     "searches": ("timestamp", 60),
     "raw_payloads": ("captured_at", 30),
+    "link_clicks": ("timestamp", 60),
+    "media_events": ("timestamp", 60),
+    "scroll_bursts": ("started_at", 60),
+    "nav_events": ("timestamp", 60),
+    "relationship_changes": ("timestamp", 60),
+    # Sensitive — shorter retention to match raw_payloads.
+    "text_selections": ("timestamp", 30),
 }
 
 

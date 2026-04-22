@@ -133,3 +133,87 @@ CREATE TABLE IF NOT EXISTS enrichment_queue (
   UNIQUE(target_type, target_id, reason)
 );
 CREATE INDEX IF NOT EXISTS idx_enq_ready ON enrichment_queue(succeeded_at, priority DESC, queued_at);
+
+-- Interaction capture v2: richer signals for AI-agent workflow analysis.
+-- All additive; existing DBs pick these up on next backend boot.
+
+-- External/internal links the user clicked from X.com. Domain extraction is
+-- done client-side to keep ingest cheap. `modifiers` is comma-joined
+-- (shift/ctrl/meta/middle) so "opened in new tab" reads distinct from "navigated".
+CREATE TABLE IF NOT EXISTS link_clicks (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  tweet_id TEXT REFERENCES tweets(tweet_id),
+  session_id TEXT REFERENCES sessions(session_id),
+  url TEXT NOT NULL,
+  domain TEXT,
+  link_kind TEXT,
+  modifiers TEXT,
+  timestamp TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_linkclicks_time    ON link_clicks(timestamp);
+CREATE INDEX IF NOT EXISTS idx_linkclicks_domain  ON link_clicks(domain);
+CREATE INDEX IF NOT EXISTS idx_linkclicks_session ON link_clicks(session_id, timestamp);
+
+-- User opened a photo/video lightbox via X's /status/{id}/photo|video/{n} route.
+CREATE TABLE IF NOT EXISTS media_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  tweet_id TEXT REFERENCES tweets(tweet_id),
+  session_id TEXT REFERENCES sessions(session_id),
+  media_kind TEXT,
+  media_index INTEGER,
+  timestamp TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_media_time    ON media_events(timestamp);
+CREATE INDEX IF NOT EXISTS idx_media_session ON media_events(session_id, timestamp);
+
+-- Text the user selected or copied from a tweet. Sensitive — 30-day retention.
+-- Text capped to 500 chars client-side AND re-validated server-side.
+CREATE TABLE IF NOT EXISTS text_selections (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  tweet_id TEXT REFERENCES tweets(tweet_id),
+  session_id TEXT REFERENCES sessions(session_id),
+  text TEXT NOT NULL,
+  via TEXT,
+  timestamp TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_selections_time    ON text_selections(timestamp);
+CREATE INDEX IF NOT EXISTS idx_selections_session ON text_selections(session_id, timestamp);
+
+-- Aggregated scroll motion — one row per burst (quiescent for ~1.5s or direction
+-- reversed > 400 px). delta_y < 0 means user scrolled back (revisit signal).
+CREATE TABLE IF NOT EXISTS scroll_bursts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id TEXT REFERENCES sessions(session_id),
+  feed_source TEXT,
+  started_at TEXT,
+  ended_at TEXT,
+  duration_ms INTEGER,
+  start_y INTEGER,
+  end_y INTEGER,
+  delta_y INTEGER,
+  reversals_count INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_bursts_session ON scroll_bursts(session_id, started_at);
+
+-- SPA navigation within X.com. Captures the user's path through the app.
+CREATE TABLE IF NOT EXISTS nav_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id TEXT REFERENCES sessions(session_id),
+  from_path TEXT,
+  to_path TEXT,
+  feed_source_before TEXT,
+  feed_source_after TEXT,
+  timestamp TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_nav_session ON nav_events(session_id, timestamp);
+
+-- Follow / mute / block. Captured from the GraphQL mutation response only on
+-- success, so failed / rate-limited actions don't appear here.
+CREATE TABLE IF NOT EXISTS relationship_changes (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id TEXT REFERENCES sessions(session_id),
+  target_user_id TEXT,
+  action TEXT,
+  timestamp TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_rel_time ON relationship_changes(timestamp);

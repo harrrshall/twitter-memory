@@ -170,6 +170,210 @@ def threads_rows(db: sqlite3.Connection, day_start: str, day_end: str, min_tweet
     return [dict(r) for r in cur.fetchall()]
 
 
+def link_clicks_rows(db: sqlite3.Connection, day_start: str, day_end: str) -> list[dict]:
+    cur = db.execute(
+        """
+        SELECT lc.timestamp, lc.url, lc.domain, lc.link_kind, lc.modifiers,
+               lc.tweet_id, lc.session_id, t.text, a.handle
+        FROM link_clicks lc
+        LEFT JOIN tweets t ON lc.tweet_id = t.tweet_id
+        LEFT JOIN authors a ON t.author_id = a.user_id
+        WHERE lc.timestamp >= ? AND lc.timestamp < ?
+        ORDER BY lc.timestamp
+        """,
+        (day_start, day_end),
+    )
+    return [dict(r) for r in cur.fetchall()]
+
+
+def media_events_rows(db: sqlite3.Connection, day_start: str, day_end: str) -> list[dict]:
+    cur = db.execute(
+        """
+        SELECT me.timestamp, me.tweet_id, me.session_id, me.media_kind, me.media_index,
+               t.text, a.handle
+        FROM media_events me
+        LEFT JOIN tweets t ON me.tweet_id = t.tweet_id
+        LEFT JOIN authors a ON t.author_id = a.user_id
+        WHERE me.timestamp >= ? AND me.timestamp < ?
+        ORDER BY me.timestamp
+        """,
+        (day_start, day_end),
+    )
+    return [dict(r) for r in cur.fetchall()]
+
+
+def text_selections_rows(db: sqlite3.Connection, day_start: str, day_end: str) -> list[dict]:
+    cur = db.execute(
+        """
+        SELECT ts.timestamp, ts.tweet_id, ts.session_id, ts.text, ts.via,
+               t.text AS tweet_text, a.handle
+        FROM text_selections ts
+        LEFT JOIN tweets t ON ts.tweet_id = t.tweet_id
+        LEFT JOIN authors a ON t.author_id = a.user_id
+        WHERE ts.timestamp >= ? AND ts.timestamp < ?
+        ORDER BY ts.timestamp
+        """,
+        (day_start, day_end),
+    )
+    return [dict(r) for r in cur.fetchall()]
+
+
+def scroll_bursts_rows(db: sqlite3.Connection, day_start: str, day_end: str) -> list[dict]:
+    cur = db.execute(
+        """
+        SELECT session_id, feed_source, started_at, ended_at, duration_ms,
+               start_y, end_y, delta_y, reversals_count
+        FROM scroll_bursts
+        WHERE started_at >= ? AND started_at < ?
+        ORDER BY started_at
+        """,
+        (day_start, day_end),
+    )
+    return [dict(r) for r in cur.fetchall()]
+
+
+def nav_events_rows(db: sqlite3.Connection, day_start: str, day_end: str) -> list[dict]:
+    cur = db.execute(
+        """
+        SELECT session_id, from_path, to_path, feed_source_before, feed_source_after, timestamp
+        FROM nav_events
+        WHERE timestamp >= ? AND timestamp < ?
+        ORDER BY timestamp
+        """,
+        (day_start, day_end),
+    )
+    return [dict(r) for r in cur.fetchall()]
+
+
+def relationship_changes_rows(db: sqlite3.Connection, day_start: str, day_end: str) -> list[dict]:
+    cur = db.execute(
+        """
+        SELECT rc.session_id, rc.target_user_id, rc.action, rc.timestamp,
+               a.handle
+        FROM relationship_changes rc
+        LEFT JOIN authors a ON rc.target_user_id = a.user_id
+        WHERE rc.timestamp >= ? AND rc.timestamp < ?
+        ORDER BY rc.timestamp
+        """,
+        (day_start, day_end),
+    )
+    return [dict(r) for r in cur.fetchall()]
+
+
+def revisits(db: sqlite3.Connection, day_start: str, day_end: str) -> dict[tuple[str, str], int]:
+    """(session_id, tweet_id) -> view count, only where count > 1."""
+    cur = db.execute(
+        """
+        SELECT session_id, tweet_id, COUNT(*) AS n
+        FROM impressions
+        WHERE first_seen_at >= ? AND first_seen_at < ?
+          AND session_id IS NOT NULL AND tweet_id IS NOT NULL
+        GROUP BY session_id, tweet_id
+        HAVING COUNT(*) > 1
+        """,
+        (day_start, day_end),
+    )
+    return {(r["session_id"], r["tweet_id"]): r["n"] for r in cur.fetchall()}
+
+
+def session_timeline(db: sqlite3.Connection, day_start: str, day_end: str) -> list[dict]:
+    """All events in one session, interleaved chronologically. UNION ALL the
+    contributing tables into a common shape:
+       (session_id, timestamp, event_kind, payload_json)
+    Ordered by (session_id, timestamp, event_log.ingested_at) so cross-tab
+    ties resolve deterministically.
+
+    Payload is compact JSON sized for inline markdown rendering; callers that
+    need richer data should hit the per-section queries.
+    """
+    # Dump each source to a (session, ts, kind, payload) tuple. Using json_object()
+    # keeps this a single SQL pass; sqlite 3.38+ has it, which aiosqlite ships with.
+    q = """
+    WITH timeline AS (
+      -- Impression ends
+      SELECT i.session_id AS session_id, i.first_seen_at AS ts,
+             'impression' AS kind,
+             json_object(
+               'tweet_id', i.tweet_id,
+               'dwell_ms', i.dwell_ms,
+               'feed_source', i.feed_source,
+               'handle', a.handle,
+               'text', substr(COALESCE(t.text, ''), 1, 120)
+             ) AS payload
+      FROM impressions i
+      LEFT JOIN tweets t ON i.tweet_id = t.tweet_id
+      LEFT JOIN authors a ON t.author_id = a.user_id
+      WHERE i.first_seen_at >= ? AND i.first_seen_at < ?
+
+      UNION ALL
+      -- Clicks (like/retweet/reply/bookmark/profile_click/expand)
+      SELECT NULL AS session_id, mi.timestamp AS ts,
+             'interaction:' || COALESCE(mi.action, '') AS kind,
+             json_object(
+               'tweet_id', mi.tweet_id,
+               'handle', a.handle
+             ) AS payload
+      FROM my_interactions mi
+      LEFT JOIN tweets t ON mi.tweet_id = t.tweet_id
+      LEFT JOIN authors a ON t.author_id = a.user_id
+      WHERE mi.timestamp >= ? AND mi.timestamp < ?
+
+      UNION ALL
+      SELECT s.session_id, s.timestamp, 'search',
+             json_object('query', s.query)
+      FROM searches s
+      WHERE s.timestamp >= ? AND s.timestamp < ?
+
+      UNION ALL
+      SELECT lc.session_id, lc.timestamp, 'link',
+             json_object(
+               'url', lc.url, 'domain', lc.domain,
+               'link_kind', lc.link_kind, 'modifiers', lc.modifiers,
+               'tweet_id', lc.tweet_id
+             )
+      FROM link_clicks lc
+      WHERE lc.timestamp >= ? AND lc.timestamp < ?
+
+      UNION ALL
+      SELECT me.session_id, me.timestamp,
+             'media:' || COALESCE(me.media_kind, ''),
+             json_object('tweet_id', me.tweet_id, 'media_index', me.media_index)
+      FROM media_events me
+      WHERE me.timestamp >= ? AND me.timestamp < ?
+
+      UNION ALL
+      SELECT ts.session_id, ts.timestamp, 'select',
+             json_object(
+               'tweet_id', ts.tweet_id, 'text', ts.text, 'via', ts.via
+             )
+      FROM text_selections ts
+      WHERE ts.timestamp >= ? AND ts.timestamp < ?
+
+      UNION ALL
+      SELECT ne.session_id, ne.timestamp, 'nav',
+             json_object(
+               'from_path', ne.from_path, 'to_path', ne.to_path,
+               'feed_source_after', ne.feed_source_after
+             )
+      FROM nav_events ne
+      WHERE ne.timestamp >= ? AND ne.timestamp < ?
+
+      UNION ALL
+      SELECT rc.session_id, rc.timestamp,
+             'rel:' || COALESCE(rc.action, ''),
+             json_object('target_user_id', rc.target_user_id, 'handle', a.handle)
+      FROM relationship_changes rc
+      LEFT JOIN authors a ON rc.target_user_id = a.user_id
+      WHERE rc.timestamp >= ? AND rc.timestamp < ?
+    )
+    SELECT session_id, ts, kind, payload FROM timeline
+    ORDER BY session_id NULLS LAST, ts, kind
+    """
+    params = (day_start, day_end) * 8
+    cur = db.execute(q, params)
+    return [dict(r) for r in cur.fetchall()]
+
+
 def impressions_rows(db: sqlite3.Connection, day_start: str, day_end: str) -> list[dict]:
     # Latest engagement snapshot per tweet via correlated subquery.
     cur = db.execute(

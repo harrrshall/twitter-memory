@@ -16,8 +16,12 @@ ALL_SECTIONS = [
     "sessions",
     "searches",
     "interactions",
+    "link_outs",
+    "selections",
+    "media",
     "top_authors",
     "threads",
+    "timeline",
     "impressions",
 ]
 

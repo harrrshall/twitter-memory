@@ -337,6 +337,175 @@ async def _handle_search(db: aiosqlite.Connection, event: dict, now: str) -> Non
     )
 
 
+# --- Interaction v2 handlers ---------------------------------------------
+# Pattern copied from _handle_interaction: stub the referenced tweet row if
+# tweet_id is present, then append. All handlers tolerate missing session_id.
+
+
+async def _ensure_tweet_stub(db: aiosqlite.Connection, tweet_id: str, now: str) -> None:
+    await db.execute(
+        "INSERT OR IGNORE INTO tweets (tweet_id, captured_at, last_updated_at) VALUES (?, ?, ?)",
+        (tweet_id, now, now),
+    )
+
+
+async def _ensure_session_stub(
+    db: aiosqlite.Connection, session_id: str | None, now: str
+) -> None:
+    """Guarantee a session row exists so FK inserts into new interaction tables
+    succeed even when the DB was wiped while the SW held an in-memory session_id.
+    Mirrors the pattern in _handle_impression_end."""
+    if not session_id:
+        return
+    await db.execute(
+        "INSERT OR IGNORE INTO sessions (session_id, started_at, total_dwell_ms, tweet_count) "
+        "VALUES (?, ?, 0, 0)",
+        (session_id, now),
+    )
+
+
+async def _handle_link_click(db: aiosqlite.Connection, event: dict, now: str) -> None:
+    url = event.get("url")
+    if not url:
+        raise ValueError("link_click missing url")
+    tweet_id = event.get("tweet_id")
+    if tweet_id:
+        await _ensure_tweet_stub(db, tweet_id, now)
+    await _ensure_session_stub(db, event.get("session_id"), now)
+    await db.execute(
+        """
+        INSERT INTO link_clicks
+          (tweet_id, session_id, url, domain, link_kind, modifiers, timestamp)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            tweet_id,
+            event.get("session_id"),
+            url,
+            event.get("domain"),
+            event.get("link_kind"),
+            event.get("modifiers"),
+            event.get("timestamp") or now,
+        ),
+    )
+
+
+async def _handle_media_open(db: aiosqlite.Connection, event: dict, now: str) -> None:
+    tweet_id = event.get("tweet_id")
+    if not tweet_id:
+        raise ValueError("media_open missing tweet_id")
+    await _ensure_tweet_stub(db, tweet_id, now)
+    await _ensure_session_stub(db, event.get("session_id"), now)
+    await db.execute(
+        """
+        INSERT INTO media_events
+          (tweet_id, session_id, media_kind, media_index, timestamp)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (
+            tweet_id,
+            event.get("session_id"),
+            event.get("media_kind"),
+            event.get("media_index"),
+            event.get("timestamp") or now,
+        ),
+    )
+
+
+async def _handle_text_selection(db: aiosqlite.Connection, event: dict, now: str) -> None:
+    text = event.get("text")
+    if not text:
+        raise ValueError("text_selection missing text")
+    # Server-side cap as defense-in-depth against a malformed client.
+    text = text[:500]
+    tweet_id = event.get("tweet_id")
+    if tweet_id:
+        await _ensure_tweet_stub(db, tweet_id, now)
+    await _ensure_session_stub(db, event.get("session_id"), now)
+    await db.execute(
+        """
+        INSERT INTO text_selections
+          (tweet_id, session_id, text, via, timestamp)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (
+            tweet_id,
+            event.get("session_id"),
+            text,
+            event.get("via"),
+            event.get("timestamp") or now,
+        ),
+    )
+
+
+async def _handle_scroll_burst(db: aiosqlite.Connection, event: dict, now: str) -> None:
+    if event.get("started_at") is None or event.get("ended_at") is None:
+        raise ValueError("scroll_burst missing started_at or ended_at")
+    await _ensure_session_stub(db, event.get("session_id"), now)
+    await db.execute(
+        """
+        INSERT INTO scroll_bursts
+          (session_id, feed_source, started_at, ended_at, duration_ms,
+           start_y, end_y, delta_y, reversals_count)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            event.get("session_id"),
+            event.get("feed_source"),
+            event.get("started_at"),
+            event.get("ended_at"),
+            event.get("duration_ms"),
+            event.get("start_y"),
+            event.get("end_y"),
+            event.get("delta_y"),
+            event.get("reversals_count") or 0,
+        ),
+    )
+
+
+async def _handle_nav_change(db: aiosqlite.Connection, event: dict, now: str) -> None:
+    to_path = event.get("to_path")
+    if not to_path:
+        raise ValueError("nav_change missing to_path")
+    await _ensure_session_stub(db, event.get("session_id"), now)
+    await db.execute(
+        """
+        INSERT INTO nav_events
+          (session_id, from_path, to_path, feed_source_before, feed_source_after, timestamp)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            event.get("session_id"),
+            event.get("from_path"),
+            to_path,
+            event.get("feed_source_before"),
+            event.get("feed_source_after"),
+            event.get("timestamp") or now,
+        ),
+    )
+
+
+async def _handle_relationship_change(db: aiosqlite.Connection, event: dict, now: str) -> None:
+    action = event.get("action")
+    target = event.get("target_user_id")
+    if not action or not target:
+        raise ValueError("relationship_change missing action or target_user_id")
+    await _ensure_session_stub(db, event.get("session_id"), now)
+    await db.execute(
+        """
+        INSERT INTO relationship_changes
+          (session_id, target_user_id, action, timestamp)
+        VALUES (?, ?, ?, ?)
+        """,
+        (
+            event.get("session_id"),
+            target,
+            action,
+            event.get("timestamp") or now,
+        ),
+    )
+
+
 HANDLERS = {
     "graphql_payload": _handle_graphql,
     "graphql_template": _handle_graphql_template,
@@ -347,6 +516,12 @@ HANDLERS = {
     "interaction": _handle_interaction,
     "search": _handle_search,
     "dom_tweet": _handle_dom_tweet,
+    "link_click": _handle_link_click,
+    "media_open": _handle_media_open,
+    "text_selection": _handle_text_selection,
+    "scroll_burst": _handle_scroll_burst,
+    "nav_change": _handle_nav_change,
+    "relationship_change": _handle_relationship_change,
 }
 
 
