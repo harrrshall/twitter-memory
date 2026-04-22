@@ -50,6 +50,17 @@
         color: #666;
         word-break: break-all;
       }
+      .row-stack {
+        margin: 4px 0;
+      }
+      .row-stack .label {
+        display: block;
+        color: #555;
+      }
+      .row-stack .path {
+        display: block;
+        margin-top: 2px;
+      }
       button {
         width: 100%;
         padding: 6px;
@@ -75,7 +86,7 @@
       <span class="label">Time today</span>
       <span id="dwell">—</span>
     </div>
-    <div class="row">
+    <div class="row-stack">
       <span class="label">Data folder</span>
       <span id="data-dir" class="path">—</span>
     </div>
