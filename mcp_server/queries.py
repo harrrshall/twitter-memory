@@ -41,10 +41,15 @@ def summary(db: sqlite3.Connection, day_start: str, day_end: str) -> dict[str, A
     )
     authors = {r["author_id"] for r in cur.fetchall() if r["author_id"]}
     cur = db.execute(
-        "SELECT COUNT(*) AS n, COALESCE(SUM(total_dwell_ms),0) AS dwell FROM sessions WHERE started_at >= ? AND started_at < ?",
+        "SELECT COUNT(*) AS n FROM sessions WHERE started_at >= ? AND started_at < ?",
         (day_start, day_end),
     )
     sess = cur.fetchone()
+    cur = db.execute(
+        "SELECT COALESCE(SUM(dwell_ms), 0) AS dwell FROM impressions WHERE first_seen_at >= ? AND first_seen_at < ?",
+        (day_start, day_end),
+    )
+    dwell_row = cur.fetchone()
     cur = db.execute(
         """
         SELECT action, COUNT(*) AS n FROM my_interactions
@@ -64,19 +69,31 @@ def summary(db: sqlite3.Connection, day_start: str, day_end: str) -> dict[str, A
         "unique_tweets": impr["unique_tweets"],
         "unique_authors": len(authors),
         "sessions": sess["n"],
-        "total_dwell_ms": sess["dwell"],
+        "total_dwell_ms": dwell_row["dwell"],
         "interactions": inter,
         "searches": searches,
     }
 
 
 def sessions_rows(db: sqlite3.Connection, day_start: str, day_end: str) -> list[dict]:
+    # tweet_count and total_dwell_ms come from the extension's session_end event, which
+    # can be 0 when the extension didn't fire or sent incomplete data. Compute both from
+    # the impressions table so the Sessions section matches the rest of the export.
     cur = db.execute(
         """
-        SELECT session_id, started_at, ended_at, total_dwell_ms, tweet_count, feeds_visited
-        FROM sessions
-        WHERE started_at >= ? AND started_at < ?
-        ORDER BY started_at
+        SELECT s.session_id, s.started_at, s.ended_at, s.feeds_visited,
+               COALESCE(i.actual_count, 0) AS tweet_count,
+               COALESCE(i.actual_dwell, 0) AS total_dwell_ms
+        FROM sessions s
+        LEFT JOIN (
+            SELECT session_id,
+                   COUNT(*) AS actual_count,
+                   SUM(dwell_ms) AS actual_dwell
+            FROM impressions
+            GROUP BY session_id
+        ) i ON i.session_id = s.session_id
+        WHERE s.started_at >= ? AND s.started_at < ?
+        ORDER BY s.started_at
         """,
         (day_start, day_end),
     )
