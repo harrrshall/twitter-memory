@@ -1,0 +1,47 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" shape-rendering="geometricPrecision">
+  <!--
+    Twitter Memory — "Pulse" icon.
+    Reads as: a luminous moment radiating through memory layers.
+    Designed for 16px legibility (core dot + gradient bg dominate at small sizes)
+    and 128px richness (rings + glow layers add depth).
+  -->
+  <defs>
+    <!-- Background gradient: deep plum into near-black for sexiness at large sizes;
+         reads as solid dark at 16px. -->
+    <radialGradient id="bgGrad" cx="50%" cy="45%" r="65%">
+      <stop offset="0%" stop-color="#1A0B2E"/>
+      <stop offset="100%" stop-color="#050208"/>
+    </radialGradient>
+
+    <!-- Core: amber/gold with a hot white center. Scales down gracefully. -->
+    <radialGradient id="core" cx="42%" cy="42%" r="58%">
+      <stop offset="0%" stop-color="#FFF7E6"/>
+      <stop offset="35%" stop-color="#FBBF24"/>
+      <stop offset="100%" stop-color="#D97706"/>
+    </radialGradient>
+
+    <!-- Halo: warm emissive glow behind the core. -->
+    <radialGradient id="halo" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#FBBF24" stop-opacity="0.75"/>
+      <stop offset="45%" stop-color="#F97316" stop-opacity="0.35"/>
+      <stop offset="100%" stop-color="#F97316" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <!-- Rounded-square background. -->
+  <rect width="128" height="128" rx="28" ry="28" fill="url(#bgGrad)"/>
+
+  <!-- Warm glow behind the core. -->
+  <circle cx="64" cy="64" r="56" fill="url(#halo)"/>
+
+  <!-- Memory-trace rings: bright, confident, not ghostly. -->
+  <circle cx="64" cy="64" r="46" fill="none" stroke="#FFFFFF" stroke-opacity="0.35" stroke-width="2.5"/>
+  <circle cx="64" cy="64" r="33" fill="none" stroke="#FFFFFF" stroke-opacity="0.55" stroke-width="2.75"/>
+  <circle cx="64" cy="64" r="21" fill="none" stroke="#FFFFFF" stroke-opacity="0.85" stroke-width="3"/>
+
+  <!-- The moment — the big bright amber core. -->
+  <circle cx="64" cy="64" r="12" fill="url(#core)"/>
+
+  <!-- Specular highlight for liveness. -->
+  <circle cx="60" cy="60" r="3.5" fill="#FFFFFF" fill-opacity="0.9"/>
+</svg>
