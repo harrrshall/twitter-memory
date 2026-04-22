@@ -184,7 +184,7 @@ async def _handle_graphql(db: aiosqlite.Connection, event: dict, now: str) -> No
 async def _handle_session_start(db: aiosqlite.Connection, event: dict, now: str) -> None:
     sid = event.get("session_id") or event.get("s")
     if not sid:
-        return
+        raise ValueError("session_start missing session_id")
     await db.execute(
         """
         INSERT INTO sessions (session_id, started_at, ended_at, total_dwell_ms, tweet_count, feeds_visited)
@@ -198,7 +198,7 @@ async def _handle_session_start(db: aiosqlite.Connection, event: dict, now: str)
 async def _handle_session_end(db: aiosqlite.Connection, event: dict, now: str) -> None:
     sid = event.get("session_id") or event.get("s")
     if not sid:
-        return
+        raise ValueError("session_end missing session_id")
     await db.execute(
         """
         UPDATE sessions
@@ -221,7 +221,7 @@ async def _handle_session_end(db: aiosqlite.Connection, event: dict, now: str) -
 async def _handle_impression_end(db: aiosqlite.Connection, event: dict, now: str) -> None:
     tweet_id = event.get("tweet_id")
     if not tweet_id:
-        return
+        raise ValueError("impression_end missing tweet_id")
     sid = event.get("session_id") or event.get("s")
     # Ensure tweet stub exists so FK holds even if GraphQL hasn't landed yet
     await db.execute(
@@ -253,7 +253,7 @@ async def _handle_interaction(db: aiosqlite.Connection, event: dict, now: str) -
     tweet_id = event.get("tweet_id")
     action = event.get("action")
     if not tweet_id or not action:
-        return
+        raise ValueError("interaction missing tweet_id or action")
     await db.execute(
         "INSERT OR IGNORE INTO tweets (tweet_id, captured_at, last_updated_at) VALUES (?, ?, ?)",
         (tweet_id, now, now),
@@ -272,7 +272,7 @@ async def _handle_dom_tweet(db: aiosqlite.Connection, event: dict, now: str) -> 
     tweet_id = event.get("tweet_id")
     handle = event.get("author_handle") or event.get("ah")
     if not tweet_id or not handle:
-        return
+        raise ValueError("dom_tweet missing tweet_id or author handle")
     # Stable pseudo user_id for DOM-only authors (prefixed so we don't collide
     # with real numeric Twitter user IDs).
     user_id = f"dom-{handle.lower()}"
@@ -330,7 +330,7 @@ async def _handle_graphql_template(db: aiosqlite.Connection, event: dict, now: s
 async def _handle_search(db: aiosqlite.Connection, event: dict, now: str) -> None:
     q = event.get("query")
     if not q:
-        return
+        raise ValueError("search missing query")
     await db.execute(
         "INSERT INTO searches (query, timestamp, session_id) VALUES (?, ?, ?)",
         (q, event.get("timestamp") or now, event.get("session_id")),
