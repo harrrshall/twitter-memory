@@ -40,10 +40,9 @@ function setBackendState(state) {
 
 async function refresh() {
   try {
-    const [statsRes, cfgRes, dqRes] = await Promise.all([
+    const [statsRes, cfgRes] = await Promise.all([
       fetchWithTimeout(`${BACKEND}/stats`, REQ_TIMEOUT_MS),
       fetchWithTimeout(`${BACKEND}/debug/config`, REQ_TIMEOUT_MS).catch(() => null),
-      fetchWithTimeout(`${BACKEND}/debug/data-quality`, REQ_TIMEOUT_MS).catch(() => null),
     ]);
     const s = await statsRes.json();
     setBackendState("ok");
@@ -54,54 +53,18 @@ async function refresh() {
       const cfg = await cfgRes.json();
       document.getElementById("data-dir").textContent = cfg.data_dir || "—";
     }
-    if (dqRes && dqRes.ok) {
-      const dq = await dqRes.json();
-      document.getElementById("dq-stubs").textContent = dq.tweets_without_text;
-      document.getElementById("dq-queue").textContent = dq.enrichment_pending;
-      document.getElementById("dq-templates").textContent = dq.graphql_templates;
-    }
   } catch (e) {
     setBackendState("bad");
   }
-  const sync = await chrome.storage.sync.get(["captureEnabled", "enrichmentEnabled"]);
+  const sync = await chrome.storage.sync.get("captureEnabled");
   const captureEnabled = sync.captureEnabled !== false;
-  const enrichmentEnabled = sync.enrichmentEnabled === true;
   document.getElementById("cap").textContent = captureEnabled ? "on" : "off";
-  document.getElementById("enrich-state").textContent = enrichmentEnabled ? "on" : "off";
 }
 
 document.getElementById("toggle").addEventListener("click", async () => {
   const { captureEnabled = true } = await chrome.storage.sync.get("captureEnabled");
   await chrome.storage.sync.set({ captureEnabled: !captureEnabled });
   refresh();
-});
-
-document.getElementById("toggle-enrich").addEventListener("click", async () => {
-  const { enrichmentEnabled = false } = await chrome.storage.sync.get("enrichmentEnabled");
-  await chrome.storage.sync.set({ enrichmentEnabled: !enrichmentEnabled });
-  refresh();
-});
-
-document.getElementById("force-enrich").addEventListener("click", async () => {
-  const btn = document.getElementById("force-enrich");
-  const status = document.getElementById("enrich-status");
-  btn.disabled = true;
-  status.textContent = "running…";
-  try {
-    const r = await chrome.runtime.sendMessage({ kind: "force_enrichment" });
-    if (!r) {
-      status.textContent = "no response from service worker";
-    } else if (r.reason === "ok") {
-      status.textContent = `✓ ${r.op} → ${r.target_id}`;
-    } else {
-      status.textContent = `${r.reason}${r.op ? " (" + r.op + ")" : ""}`;
-    }
-    refresh();
-  } catch (e) {
-    status.textContent = `error: ${e.message || e}`;
-  } finally {
-    btn.disabled = false;
-  }
 });
 
 document.getElementById("export").addEventListener("click", async () => {

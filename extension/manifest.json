@@ -3,7 +3,7 @@
   "name": "Twitter Memory (local)",
   "version": "0.1.0",
   "description": "Local-first capture of your Twitter/X activity. Data stays on your machine.",
-  "permissions": ["storage", "scripting", "tabs", "alarms", "cookies"],
+  "permissions": ["storage", "scripting", "tabs", "alarms"],
   "host_permissions": [
     "https://twitter.com/*",
     "https://x.com/*",
@@ -18,16 +18,22 @@
       "matches": ["https://twitter.com/*", "https://x.com/*"],
       "js": ["content-script.js"],
       "run_at": "document_start"
-    },
-    {
-      "matches": ["https://twitter.com/*", "https://x.com/*"],
-      "js": ["injected.js"],
-      "run_at": "document_start",
-      "world": "MAIN"
     }
   ],
   "action": {
     "default_popup": "popup.html",
-    "default_title": "Twitter Memory"
+    "default_title": "Twitter Memory",
+    "default_icon": {
+      "16": "icons/icon-16.png",
+      "32": "icons/icon-32.png",
+      "48": "icons/icon-48.png",
+      "128": "icons/icon-128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon-16.png",
+    "32": "icons/icon-32.png",
+    "48": "icons/icon-48.png",
+    "128": "icons/icon-128.png"
   }
 }

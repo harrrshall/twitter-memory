@@ -2,8 +2,6 @@
 // boundaries, flushes to 127.0.0.1:8765/ingest every 3s or at 50 events.
 // Persists queue to chrome.storage.local so a backend outage is recoverable.
 
-import { forceTick, noteOrganicEvent } from "./enrichment.js";
-
 const BACKEND_URL = "http://127.0.0.1:8765/ingest";
 const FLUSH_INTERVAL_MS = 3000;
 const BATCH_SIZE = 50;
@@ -137,22 +135,14 @@ chrome.alarms.onAlarm.addListener((a) => {
 
 // --- Messaging ------------------------------------------------------------
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-  // Popup → SW: force an enrichment tick now. Returns a status object.
-  if (msg && msg.kind === "force_enrichment") {
-    forceTick().then((r) => sendResponse(r)).catch((e) => sendResponse({ error: String(e) }));
-    return true; // keep message channel open for async sendResponse
-  }
   if (!msg || msg.kind !== "event") return;
   if (!captureEnabled) return;
   const ev = msg.event;
   if (!ev || !ev.type) return;
 
-  // Any event from a Twitter tab implies activity. The enrichment worker
-  // uses this to gate its own background fetches to periods of real use.
   if (sender.tab?.id) {
     ensureSession(sender.tab.id);
     ev.tab_id = sender.tab.id;
-    noteOrganicEvent();
   }
 
   // Attach session + track per-session counts.
@@ -171,11 +161,6 @@ async function injectIntoOpenTabs() {
   for (const t of tabs) {
     if (typeof t.id !== "number") continue;
     try {
-      await chrome.scripting.executeScript({
-        target: { tabId: t.id },
-        files: ["injected.js"],
-        world: "MAIN",
-      });
       await chrome.scripting.executeScript({
         target: { tabId: t.id },
         files: ["content-script.js"],

@@ -1,71 +1,21 @@
-// Runs in ISOLATED world. Relays GraphQL payloads from injected.js to the
-// service worker, and emits DOM-observed events: impressions (dwell),
-// interactions (clicks on like/rt/reply/bookmark/profile/expand), searches,
-// link_clicks, media opens, text selections, scroll bursts, nav changes,
-// and relationship changes (follow/mute/block, forwarded from injected.js).
+// Runs in ISOLATED world. Pure DOM-only capture: no page-global mutation,
+// no fetch/XHR patching, no outbound Twitter traffic. Emits impressions
+// (dwell), dom_tweet (synthesized from the rendered DOM when a tweet first
+// becomes visible), interactions (like/rt/reply/bookmark/profile/expand),
+// searches, link_clicks, media opens, text selections, scroll bursts, nav
+// changes, and relationship changes (observed via DOM state flip).
 
 (() => {
-  // Guard against double-injection (manifest + retroactive chrome.scripting).
   if (window.__tm_content_loaded__) return;
   window.__tm_content_loaded__ = true;
 
-  const GRAPHQL_TAG = "__tm_graphql__";
-  const TEMPLATE_TAG = "__tm_graphql_template__";
-  const MUTATION_TAG = "__tm_mutation__";
-  const NAV_TAG = "__tm_nav__";
-
-  // Debounce / threshold knobs for v2 signal capture. Tuned per the plan's
-  // performance budget (§Performance + anti-bot rules). If scroll_bursts
-  // explode past ~50/session, raise SCROLL_QUIESCENT_MS to 2000.
   const SELECTION_DEBOUNCE_MS = 1000;
   const SELECTION_MAX_CHARS = 500;
   const SCROLL_QUIESCENT_MS = 1500;
   const SCROLL_REVERSAL_THRESHOLD_PX = 400;
   const LINK_FALLBACK_KEY = "__tm_pending_link__";
-
-  // Dev hook: a custom DOM event on x.com pages that flips enrichmentEnabled
-  // in chrome.storage.sync. Only reachable from x.com origins (matches
-  // manifest host_permissions), which are first-party to the user anyway.
-  window.addEventListener("__tm_dev_set_enrichment__", (ev) => {
-    const on = !!(ev && ev.detail && ev.detail.on);
-    try {
-      chrome.storage.sync.set({ enrichmentEnabled: on });
-    } catch (_) {}
-  });
-
-  // --- GraphQL relay -------------------------------------------------------
-  window.addEventListener("message", (ev) => {
-    if (ev.source !== window) return;
-    const data = ev.data;
-    if (!data) return;
-    if (data.type === GRAPHQL_TAG) {
-      send({
-        type: "graphql_payload",
-        operation_name: data.operation_name,
-        url: data.url,
-        payload: data.payload,
-      });
-    } else if (data.type === TEMPLATE_TAG) {
-      send({
-        type: "graphql_template",
-        operation_name: data.operation_name,
-        url: data.url,
-        auth: data.auth,
-      });
-    } else if (data.type === MUTATION_TAG) {
-      // injected.js has already success-gated the mutation (2xx + no errors).
-      send({
-        type: "relationship_change",
-        action: data.action,
-        target_user_id: data.target_user_id,
-        timestamp: data.timestamp || nowIso(),
-      });
-    } else if (data.type === NAV_TAG) {
-      // injected.js observed a MAIN-world history.pushState / replaceState.
-      // Re-check the path and emit search / nav_change / media_open as needed.
-      if (typeof checkSearchAndNav === "function") checkSearchAndNav();
-    }
-  });
+  const NAV_POLL_MS = 250;
+  const RELATIONSHIP_CONFIRM_MS = 2000;
 
   // --- Helpers -------------------------------------------------------------
   function send(event) {
@@ -88,6 +38,175 @@
     if (!link) return null;
     const m = link.getAttribute("href").match(/\/status\/(\d+)/);
     return m ? m[1] : null;
+  }
+
+  // Tweet text is composed of text nodes + inline <img alt="..."> for custom
+  // emoji. innerText drops the alts; walk nodes to preserve them.
+  function tweetTextFromNode(root) {
+    if (!root) return null;
+    let out = "";
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT);
+    let n;
+    while ((n = walker.nextNode())) {
+      if (n.nodeType === 3) {
+        out += n.nodeValue;
+      } else if (n.nodeType === 1) {
+        if (n.tagName === "IMG" && n.alt) out += n.alt;
+        else if (n.tagName === "BR") out += "\n";
+      }
+    }
+    return out.trim() || null;
+  }
+
+  // Twitter's aria-labels embed exact integer counts, e.g. "1,234 Likes. Like".
+  // Abbreviated display text ("1.2K") would lose precision; always prefer aria.
+  function countFromAria(el) {
+    if (!el) return null;
+    const label = el.getAttribute("aria-label") || "";
+    const m = label.match(/([\d,]+)/);
+    if (!m) return null;
+    const n = parseInt(m[1].replace(/,/g, ""), 10);
+    return Number.isFinite(n) ? n : null;
+  }
+
+  function extractAuthorFromArticle(art) {
+    // [data-testid="User-Name"] holds both display name and @handle links.
+    // The handle link's href is "/handle" (single path segment, no /status).
+    const userNameBlock = art.querySelector('[data-testid="User-Name"]');
+    let handle = null;
+    let displayName = null;
+    if (userNameBlock) {
+      const anchors = userNameBlock.querySelectorAll('a[role="link"]');
+      for (const a of anchors) {
+        const href = a.getAttribute("href") || "";
+        const m = href.match(/^\/([A-Za-z0-9_]{1,15})$/);
+        if (m) {
+          handle = m[1];
+          break;
+        }
+      }
+      // Display name — the first span group inside the User-Name block that's
+      // not the @handle.
+      const firstSpan = userNameBlock.querySelector("span");
+      if (firstSpan) displayName = (firstSpan.innerText || "").trim() || null;
+    }
+    return { handle, displayName };
+  }
+
+  // Parse a numeric token from Twitter's aria-labels. Handles exact integers
+  // ("12,345"), abbreviations ("12.3K", "1.4M", "2B"), and plain digits.
+  function parseCount(token) {
+    if (!token) return null;
+    const s = token.replace(/,/g, "").trim();
+    const m = s.match(/^(\d+(?:\.\d+)?)([KMB])?$/i);
+    if (!m) {
+      const plain = parseInt(s, 10);
+      return Number.isFinite(plain) ? plain : null;
+    }
+    const base = parseFloat(m[1]);
+    const suf = (m[2] || "").toUpperCase();
+    const mult = suf === "K" ? 1000 : suf === "M" ? 1_000_000 : suf === "B" ? 1_000_000_000 : 1;
+    return Math.round(base * mult);
+  }
+
+  // View count lives in one of three places on Twitter/X's current UI:
+  // 1. A dedicated analytics link `a[href*="/analytics"]` (author view).
+  // 2. The action-bar `role="group"` aria-label that sometimes concatenates all
+  //    engagement: "N replies, N reposts, N likes, N views".
+  // 3. An `aria-label` on a standalone element ending in "Views" / "View" —
+  //    Twitter often emits `aria-label="12.3K Views"` on the view-count chip.
+  function extractViewCount(art) {
+    const analyticsLink = art.querySelector('a[href*="/analytics"]');
+    if (analyticsLink) {
+      const label = analyticsLink.getAttribute("aria-label") || "";
+      const m = label.match(/([\d.,]+[KMB]?)\s*[Vv]iew/);
+      if (m) {
+        const n = parseCount(m[1]);
+        if (n !== null) return n;
+      }
+    }
+    const group = art.querySelector('[role="group"][aria-label]');
+    if (group) {
+      const label = group.getAttribute("aria-label") || "";
+      const m = label.match(/([\d.,]+[KMB]?)\s*[Vv]iew/);
+      if (m) {
+        const n = parseCount(m[1]);
+        if (n !== null) return n;
+      }
+    }
+    // Last-ditch scan: any descendant whose aria-label ends in "Views".
+    const all = art.querySelectorAll("[aria-label]");
+    for (const el of all) {
+      const label = el.getAttribute("aria-label") || "";
+      const m = label.match(/^([\d.,]+[KMB]?)\s*[Vv]iews?$/);
+      if (m) {
+        const n = parseCount(m[1]);
+        if (n !== null) return n;
+      }
+    }
+    return null;
+  }
+
+  function extractMediaFromArticle(art) {
+    const media = [];
+    art.querySelectorAll('[data-testid="tweetPhoto"] img[src]').forEach((img) => {
+      const src = img.getAttribute("src");
+      if (src && src.includes("pbs.twimg.com")) media.push({ type: "image", url: src });
+    });
+    art.querySelectorAll("video").forEach((v) => {
+      const poster = v.getAttribute("poster");
+      if (poster) media.push({ type: "video", url: poster });
+    });
+    return media.length ? media : null;
+  }
+
+  // Emit a dom_tweet event carrying everything we can pull off the rendered
+  // article. Safe to call multiple times per tweet — backend upsert is idempotent.
+  function emitDomTweet(art) {
+    const tweet_id = closestTweetId(art);
+    if (!tweet_id) return;
+    const { handle, displayName } = extractAuthorFromArticle(art);
+    if (!handle) return; // backend requires author_handle
+    const timeEl = art.querySelector("time[datetime]");
+    const createdAt = timeEl ? timeEl.getAttribute("datetime") : null;
+    const textEl = art.querySelector('[data-testid="tweetText"]');
+    const text = tweetTextFromNode(textEl);
+    const likes = countFromAria(art.querySelector('[data-testid="like"], [data-testid="unlike"]'));
+    const retweets = countFromAria(art.querySelector('[data-testid="retweet"], [data-testid="unretweet"]'));
+    const replies = countFromAria(art.querySelector('[data-testid="reply"]'));
+    const views = extractViewCount(art);
+    const media = extractMediaFromArticle(art);
+    // Quoted tweet: a nested article inside this one (Twitter wraps quoted
+    // tweets in a role="link" container containing their own tweetText).
+    let quoted_tweet_id = null;
+    const quoted = art.querySelector('[role="link"] article, div[role="link"] [data-testid="tweetText"]');
+    if (quoted) {
+      const qLink = quoted.closest("a[href*='/status/']") ||
+                    art.querySelectorAll("a[href*='/status/']")[1];
+      if (qLink) {
+        const qm = (qLink.getAttribute("href") || "").match(/\/status\/(\d+)/);
+        if (qm && qm[1] !== tweet_id) quoted_tweet_id = qm[1];
+      }
+    }
+    // Retweet socialContext indicator: "<user> reposted" above the article.
+    const social = art.querySelector('[data-testid="socialContext"]');
+    const is_retweet = !!(social && /reposted|retweeted/i.test(social.textContent || ""));
+    send({
+      type: "dom_tweet",
+      tweet_id,
+      author_handle: handle,
+      author_display: displayName,
+      text,
+      created_at_iso: createdAt,
+      like_count: likes,
+      retweet_count: retweets,
+      reply_count: replies,
+      view_count: views,
+      media_json: media ? JSON.stringify(media) : null,
+      quoted_tweet_id,
+      is_retweet,
+      timestamp: nowIso(),
+    });
   }
 
   function feedSourceFromPath(path) {
@@ -171,8 +290,13 @@
             visibleSince: visible ? now : 0,
             totalDwell: 0,
             feed: feedSourceFromPath(),
+            domEmitted: false,
           };
           seenTweets.set(art, rec);
+          // Tweet is in the DOM as soon as we observe it — emit the DOM
+          // synthesis immediately, regardless of first-frame visibility.
+          emitDomTweet(art);
+          rec.domEmitted = true;
           if (visible) {
             send({
               type: "impression_start",
@@ -551,15 +675,71 @@
       });
     }
   }
-  // history.pushState / replaceState is patched in injected.js (MAIN world) —
-  // an isolated-world patch here would be dead code, since X.com's SPA router
-  // calls pushState from MAIN world and each world has its own prototype chain.
-  // popstate fires as a real browser event, so the listener below crosses worlds.
+  // Isolated-world SPA nav detection: polling location.href every 250ms is
+  // cheaper than monkey-patching history.pushState and leaves zero page-global
+  // side effects. checkSearchAndNav is a no-op when the path hasn't changed.
   window.addEventListener("popstate", () => setTimeout(checkSearchAndNav, 10));
   window.addEventListener("load", () => {
     drainPendingLinks();
     checkSearchAndNav();
   });
+  setInterval(checkSearchAndNav, NAV_POLL_MS);
   drainPendingLinks();
   checkSearchAndNav();
+
+  // --- Relationship changes (follow / unfollow / mute / block) -------------
+  // Twitter follow buttons carry data-testid of the form `{user_id}-follow`
+  // or `{user_id}-unfollow`. On click we start a short-lived MutationObserver
+  // on the button and emit only if the label flips within ~2s — that confirms
+  // the server-side accepted the action (and filters out double-clicks /
+  // rate-limited attempts).
+  const FOLLOW_TESTID_RE = /^(\d+)-(follow|unfollow)$/;
+
+  function findFollowButton(el) {
+    let cur = el;
+    for (let i = 0; i < 6 && cur; i++) {
+      if (cur.dataset && cur.dataset.testid) {
+        const m = cur.dataset.testid.match(FOLLOW_TESTID_RE);
+        if (m) return { btn: cur, user_id: m[1], action: m[2] };
+      }
+      cur = cur.parentElement;
+    }
+    return null;
+  }
+
+  function watchButtonFlip(btn, initialLabel, action, user_id) {
+    const start = Date.now();
+    const obs = new MutationObserver(() => {
+      const current = (btn.textContent || "").trim();
+      if (current && current !== initialLabel) {
+        obs.disconnect();
+        // Label flipped: Follow→Following (confirmed follow),
+        // Following→Follow (confirmed unfollow). Action reflects the click.
+        send({
+          type: "relationship_change",
+          action,
+          target_user_id: user_id,
+          timestamp: nowIso(),
+        });
+      } else if (Date.now() - start > RELATIONSHIP_CONFIRM_MS) {
+        obs.disconnect();
+      }
+    });
+    obs.observe(btn, { childList: true, characterData: true, subtree: true });
+    // Hard timeout — MutationObserver won't fire if nothing changes.
+    setTimeout(() => obs.disconnect(), RELATIONSHIP_CONFIRM_MS + 50);
+  }
+
+  document.addEventListener(
+    "click",
+    (ev) => {
+      const t = ev.target;
+      if (!(t instanceof Element)) return;
+      const hit = findFollowButton(t);
+      if (!hit) return;
+      const initial = (hit.btn.textContent || "").trim();
+      watchButtonFlip(hit.btn, initial, hit.action, hit.user_id);
+    },
+    true,
+  );
 })();
