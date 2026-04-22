@@ -500,6 +500,53 @@ def _score_tweets(unique_tweets: list[dict]) -> list[dict]:
     return out
 
 
+def _read_speed_summary(unique_tweets: list[dict], impressions: list[dict]) -> str | None:
+    """Compute a human summary of reading speed for the TL;DR.
+
+    WPM per impression = (char_count / 5) / (dwell_ms / 60000), using
+    impressions with ``dwell_ms >= 2000`` so division noise from zero-dwell
+    scroll-bys doesn't dominate. Needs at least 5 qualifying impressions to
+    surface (otherwise the number is too noisy to be useful).
+
+    Returns e.g. "median 320 WPM across 42 real reads · 87% fast-scroll (<500ms)"
+    or ``None`` when there aren't enough samples.
+    """
+    if not impressions:
+        return None
+    char_by_id = {
+        t.get("tweet_id"): len(_clean_text(t.get("text")) or "")
+        for t in unique_tweets
+    }
+    wpms: list[float] = []
+    fast_scroll = 0
+    for im in impressions:
+        dwell = im.get("dwell_ms") or 0
+        if dwell < 500:
+            fast_scroll += 1
+        if dwell < 2000:
+            continue
+        chars = char_by_id.get(im.get("tweet_id"))
+        if not chars:
+            continue
+        words = chars / 5.0
+        minutes = dwell / 60000.0
+        if minutes <= 0:
+            continue
+        wpm = words / minutes
+        # Implausible WPM (>2000) = likely empty text or stub row; drop.
+        if wpm > 2000:
+            continue
+        wpms.append(wpm)
+    if len(wpms) < 3:
+        return None
+    median_wpm = int(sorted(wpms)[len(wpms) // 2])
+    fast_pct = round(100 * fast_scroll / len(impressions)) if impressions else 0
+    return (
+        f"median {median_wpm} WPM across {len(wpms)} real read{'s' if len(wpms) != 1 else ''} "
+        f"· {fast_pct}% fast-scroll (<500ms)"
+    )
+
+
 def render_tldr(
     summary: dict,
     unique_tweets: list[dict],
@@ -599,6 +646,10 @@ def render_tldr(
 
     if zero_pct >= 50 and total_imp_rows:
         lines.append(f"- **Scroll intensity:** {zero_pct}% of impressions had 0s dwell (very fast scroll).")
+
+    wpm_summary = _read_speed_summary(unique_tweets, impressions)
+    if wpm_summary:
+        lines.append(f"- **Read speed:** {wpm_summary}.")
 
     if anomaly_hits:
         lines.append("- **Anomalies:**")
@@ -918,6 +969,227 @@ def build_markdown(
         db.close()
 
 
+def _eng_from_row(r: dict) -> dict:
+    return {
+        "likes": r.get("likes"),
+        "retweets": r.get("retweets"),
+        "replies": r.get("replies"),
+        "views": r.get("views"),
+    }
+
+
+def build_json(
+    db_path: Path,
+    target_date: date_cls,
+) -> dict[str, Any]:
+    """Structured companion to build_markdown. Same data, machine-parseable.
+
+    Agents should prefer this over regex-ing the markdown. Shape is flat
+    arrays with stable keys. Fields that only appear in certain tables
+    (e.g., quoted_tweet_id, verified) are always present in the row with
+    ``null`` when not applicable.
+    """
+    tz = settings.local_tz()
+    day_start, day_end = queries.day_window_utc(target_date, tz)
+    db = queries.connect_ro(db_path)
+    try:
+        summary_data = queries.summary(db, day_start, day_end)
+        raw_unique = queries.unique_tweets_with_engagement(db, day_start, day_end)
+        unique_tweets = _score_tweets(_enrich_with_topics(raw_unique))
+        session_rows = queries.sessions_rows(db, day_start, day_end)
+        impression_rows = queries.impressions_rows(db, day_start, day_end)
+
+        # Tweets ranked (sorted by importance DESC, same rule as the md section)
+        tweets_ranked = sorted(
+            _stub_free(unique_tweets),
+            key=lambda t: (
+                -(t.get("importance") or 0),
+                -(t.get("impressions_count") or 0),
+                -(t.get("views") or 0),
+            ),
+        )
+        tweets_ranked_out = [
+            {
+                "rank": rank,
+                "tweet_id": t.get("tweet_id"),
+                "importance": t.get("importance"),
+                "handle": t.get("handle"),
+                "display_name": t.get("display_name"),
+                "verified": bool(t.get("verified")) if t.get("verified") is not None else None,
+                "text": _clean_text(t.get("text")),
+                "created_at": t.get("created_at"),
+                "conversation_id": t.get("conversation_id"),
+                "quoted_tweet_id": t.get("quoted_tweet_id"),
+                "retweeted_tweet_id": t.get("retweeted_tweet_id"),
+                "reply_to_tweet_id": t.get("reply_to_tweet_id"),
+                "has_media": _has_media(t.get("media_json")),
+                "media_json": t.get("media_json"),
+                "impressions_count": t.get("impressions_count") or 0,
+                "total_dwell_ms": t.get("total_dwell_ms") or 0,
+                "sessions_hit": [
+                    s for s in (t.get("sessions_hit_csv") or "").split(",") if s
+                ],
+                "engagement": _eng_from_row(t),
+                "topics": t.get("topics") or [],
+                "user_had_interaction": bool(t.get("user_had_interaction")),
+                "first_seen_at": t.get("first_seen_at"),
+            }
+            for rank, t in enumerate(tweets_ranked, 1)
+        ]
+
+        # Topic rollup
+        buckets: dict[str, list[dict]] = {}
+        for t in _stub_free(unique_tweets):
+            for tag in t.get("topics") or ["untagged"]:
+                buckets.setdefault(tag, []).append(t)
+        topics_out = [
+            {
+                "name": tag,
+                "tweet_count": len(tws),
+                "total_dwell_ms": sum(t.get("total_dwell_ms") or 0 for t in tws),
+                "notable_handles": [
+                    t.get("handle")
+                    for t in sorted(
+                        tws,
+                        key=lambda t: -(t.get("total_dwell_ms") or 0)
+                        - (t.get("impressions_count") or 0),
+                    )[:4]
+                    if t.get("handle")
+                ],
+            }
+            for tag, tws in sorted(
+                buckets.items(),
+                key=lambda kv: (kv[0] == "untagged", -len(kv[1]), kv[0]),
+            )
+        ]
+
+        # Anomalies (same function as render_tldr)
+        tweet_topic_map = {t.get("tweet_id"): t.get("topics") for t in unique_tweets}
+        imp_topics = [
+            (im.get("first_seen_at") or "", tweet_topic_map.get(im.get("tweet_id")) or ["untagged"])
+            for im in impression_rows
+        ]
+        anomaly_hits = anomalies.detect(session_rows, impression_rows, imp_topics, tz)
+
+        interactions_out = [
+            {
+                "tweet_id": r.get("tweet_id"),
+                "action": r.get("action"),
+                "timestamp": r.get("timestamp"),
+                "handle": r.get("handle"),
+                "text_preview": _preview(r.get("text"), 80),
+            }
+            for r in queries.interactions_rows(db, day_start, day_end)
+        ]
+
+        sessions_out = [
+            {
+                "session_id": r.get("session_id"),
+                "started_at": r.get("started_at"),
+                "ended_at": r.get("ended_at"),
+                "tweet_count": r.get("tweet_count") or 0,
+                "total_dwell_ms": r.get("total_dwell_ms") or 0,
+                "feeds_visited": _parse_json_list(r.get("feeds_visited")),
+            }
+            for r in session_rows
+        ]
+
+        authors_out = [
+            {
+                "handle": r.get("handle"),
+                "user_id": r.get("user_id"),
+                "display_name": r.get("display_name"),
+                "verified": bool(r.get("verified")) if r.get("verified") is not None else None,
+                "follower_count": r.get("follower_count"),
+                "impressions_count": r.get("impressions_count") or 0,
+                "unique_tweets": r.get("unique_tweets") or 0,
+                "total_dwell_ms": r.get("total_dwell_ms") or 0,
+            }
+            for r in queries.author_context_rows(db, day_start, day_end)
+        ]
+
+        link_outs = [
+            {
+                "url": r.get("url"),
+                "domain": r.get("domain"),
+                "link_kind": r.get("link_kind"),
+                "modifiers": r.get("modifiers"),
+                "timestamp": r.get("timestamp"),
+                "tweet_id": r.get("tweet_id"),
+                "handle": r.get("handle"),
+            }
+            for r in queries.link_clicks_rows(db, day_start, day_end)
+        ]
+
+        selections = [
+            {
+                "tweet_id": r.get("tweet_id"),
+                "text": r.get("text"),
+                "via": r.get("via"),
+                "timestamp": r.get("timestamp"),
+                "handle": r.get("handle"),
+            }
+            for r in queries.text_selections_rows(db, day_start, day_end)
+        ]
+
+        media = [
+            {
+                "tweet_id": r.get("tweet_id"),
+                "media_kind": r.get("media_kind"),
+                "media_index": r.get("media_index"),
+                "timestamp": r.get("timestamp"),
+                "handle": r.get("handle"),
+            }
+            for r in queries.media_events_rows(db, day_start, day_end)
+        ]
+
+        searches = [
+            {
+                "query": r.get("query"),
+                "timestamp": r.get("timestamp"),
+                "session_id": r.get("session_id"),
+            }
+            for r in queries.searches_rows(db, day_start, day_end)
+        ]
+
+        return {
+            "date": target_date.isoformat(),
+            "generated_at": datetime.now(tz).isoformat(timespec="seconds"),
+            "timezone": str(tz),
+            "summary": {
+                "sessions": summary_data.get("sessions", 0),
+                "impressions": summary_data.get("tweets_seen", 0),
+                "unique_tweets": summary_data.get("unique_tweets", 0),
+                "unique_authors": summary_data.get("unique_authors", 0),
+                "total_dwell_ms": summary_data.get("total_dwell_ms", 0),
+                "searches": summary_data.get("searches", 0),
+                "interactions_by_action": summary_data.get("interactions") or {},
+            },
+            "anomalies": anomaly_hits,
+            "tweets_ranked": tweets_ranked_out,
+            "topics": topics_out,
+            "authors": authors_out,
+            "sessions": sessions_out,
+            "interactions": interactions_out,
+            "searches": searches,
+            "link_outs": link_outs,
+            "selections": selections,
+            "media": media,
+        }
+    finally:
+        db.close()
+
+
+def _parse_json_list(raw: str | None) -> list:
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        return []
+    return parsed if isinstance(parsed, list) else []
+
+
 def write_export(
     db_path: Path,
     target_date: date_cls,
@@ -926,13 +1198,24 @@ def write_export(
     settings.ensure_exports_dir()
     markdown, included, stats = build_markdown(db_path, target_date, exclude)
 
-    file_path = settings.EXPORTS_DIR / f"{target_date.isoformat()}.md"
-    file_path.write_text(markdown, encoding="utf-8")
+    md_path = settings.EXPORTS_DIR / f"{target_date.isoformat()}.md"
+    md_path.write_text(markdown, encoding="utf-8")
+
+    # JSON companion — always written alongside the markdown. Ignores
+    # ``exclude`` (the JSON is structural, not presentational, so callers
+    # that want a subset should filter keys themselves).
+    json_data = build_json(db_path, target_date)
+    json_path = settings.EXPORTS_DIR / f"{target_date.isoformat()}.json"
+    json_path.write_text(
+        json.dumps(json_data, indent=2, ensure_ascii=False, default=str),
+        encoding="utf-8",
+    )
 
     byte_size = len(markdown.encode("utf-8"))
     truncated = byte_size > settings.INLINE_CONTENT_CAP_BYTES
     return {
-        "file_path": str(file_path),
+        "file_path": str(md_path),
+        "json_path": str(json_path),
         "sections_included": included,
         "tweet_count": stats["tweet_count"],
         "interaction_count": stats["interaction_count"],
