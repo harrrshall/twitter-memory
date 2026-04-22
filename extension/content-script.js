@@ -1,6 +1,8 @@
 // Runs in ISOLATED world. Relays GraphQL payloads from injected.js to the
 // service worker, and emits DOM-observed events: impressions (dwell),
-// interactions (clicks on like/rt/reply/bookmark/profile/expand), and searches.
+// interactions (clicks on like/rt/reply/bookmark/profile/expand), searches,
+// link_clicks, media opens, text selections, scroll bursts, nav changes,
+// and relationship changes (follow/mute/block, forwarded from injected.js).
 
 (() => {
   // Guard against double-injection (manifest + retroactive chrome.scripting).
@@ -9,6 +11,17 @@
 
   const GRAPHQL_TAG = "__tm_graphql__";
   const TEMPLATE_TAG = "__tm_graphql_template__";
+  const MUTATION_TAG = "__tm_mutation__";
+  const NAV_TAG = "__tm_nav__";
+
+  // Debounce / threshold knobs for v2 signal capture. Tuned per the plan's
+  // performance budget (§Performance + anti-bot rules). If scroll_bursts
+  // explode past ~50/session, raise SCROLL_QUIESCENT_MS to 2000.
+  const SELECTION_DEBOUNCE_MS = 1000;
+  const SELECTION_MAX_CHARS = 500;
+  const SCROLL_QUIESCENT_MS = 1500;
+  const SCROLL_REVERSAL_THRESHOLD_PX = 400;
+  const LINK_FALLBACK_KEY = "__tm_pending_link__";
 
   // Dev hook: a custom DOM event on x.com pages that flips enrichmentEnabled
   // in chrome.storage.sync. Only reachable from x.com origins (matches
@@ -39,6 +52,18 @@
         url: data.url,
         auth: data.auth,
       });
+    } else if (data.type === MUTATION_TAG) {
+      // injected.js has already success-gated the mutation (2xx + no errors).
+      send({
+        type: "relationship_change",
+        action: data.action,
+        target_user_id: data.target_user_id,
+        timestamp: data.timestamp || nowIso(),
+      });
+    } else if (data.type === NAV_TAG) {
+      // injected.js observed a MAIN-world history.pushState / replaceState.
+      // Re-check the path and emit search / nav_change / media_open as needed.
+      if (typeof checkSearchAndNav === "function") checkSearchAndNav();
     }
   });
 
@@ -65,8 +90,8 @@
     return m ? m[1] : null;
   }
 
-  function feedSourceFromPath() {
-    const path = location.pathname;
+  function feedSourceFromPath(path) {
+    path = path || location.pathname;
     if (path === "/home") return "for_you"; // refined client-side with tab state later
     if (path.startsWith("/search")) return "search";
     if (path.startsWith("/i/bookmarks")) return "bookmarks";
@@ -75,6 +100,53 @@
     if (parts.length >= 3 && parts[1] === "status") return "thread";
     if (parts.length === 1) return "profile";
     return "other";
+  }
+
+  function domainOf(url) {
+    try {
+      return new URL(url, location.href).hostname || null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  // Classify a link as internal_tweet / internal_profile / hashtag / mention /
+  // external. Used so agents can distinguish "read another tweet" from
+  // "left the platform entirely to research something".
+  function classifyLink(href) {
+    let u;
+    try {
+      u = new URL(href, location.href);
+    } catch (_) {
+      return "external";
+    }
+    const host = u.hostname;
+    const isX = host === "x.com" || host === "twitter.com" ||
+                host.endsWith(".x.com") || host.endsWith(".twitter.com");
+    if (!isX) return "external";
+    const p = u.pathname || "/";
+    if (/\/status\/\d+/.test(p)) return "internal_tweet";
+    if (p.startsWith("/hashtag/")) return "hashtag";
+    if (p.startsWith("/search")) {
+      // Mentions and hashtags land in /search?q=... as well — classify by q prefix.
+      const q = u.searchParams.get("q") || "";
+      if (q.startsWith("@")) return "mention";
+      if (q.startsWith("#")) return "hashtag";
+      return "internal_tweet"; // search result link — treated as internal
+    }
+    const parts = p.split("/").filter(Boolean);
+    if (parts.length === 1) return "internal_profile";
+    return "internal_tweet";
+  }
+
+  function modifiersFromEvent(ev) {
+    const m = [];
+    if (ev.shiftKey) m.push("shift");
+    if (ev.ctrlKey) m.push("ctrl");
+    if (ev.metaKey) m.push("meta");
+    if (ev.altKey) m.push("alt");
+    if (ev.button === 1) m.push("middle");
+    return m.join(",");
   }
 
   // --- Impression tracking -------------------------------------------------
@@ -187,6 +259,15 @@
       // Prevent double-flush by marking as flushed.
       rec.totalDwell = 0;
     });
+    // v2 buffered state: close any open scroll burst, fire any debounced
+    // selection, and drain sessionStorage link fallback.
+    if (typeof closeBurst === "function") closeBurst();
+    if (selectionTimer) {
+      clearTimeout(selectionTimer);
+      selectionTimer = null;
+      emitSelection("select");
+    }
+    drainPendingLinks();
   }
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "hidden") flushAll();
@@ -203,11 +284,71 @@
     ["expand", '[data-testid="caret"]'],
   ];
 
+  // Shared click listener: first checks for a link (link_click event with
+  // sessionStorage fallback for same-tab navigation), then falls through to
+  // the interaction selector map. Single listener, capture phase, no
+  // preventDefault / stopPropagation — pure observation.
+  function handleLinkClick(ev, linkEl) {
+    const href = linkEl.getAttribute("href") || "";
+    if (!href || href.startsWith("javascript:") || href.startsWith("#")) return;
+    const absolute = new URL(href, location.href).toString();
+    const tweet_id = closestTweetId(linkEl); // may be null (click outside any article)
+    const link_kind = classifyLink(absolute);
+    const modifiers = modifiersFromEvent(ev);
+    const event_id = crypto.randomUUID();
+    const payload = {
+      type: "link_click",
+      event_id,
+      tweet_id,
+      url: absolute,
+      domain: domainOf(absolute),
+      link_kind,
+      modifiers,
+      timestamp: nowIso(),
+    };
+    // Same-tab navigations race chrome.runtime.sendMessage. Stash a copy in
+    // sessionStorage *before* the async send — drained on next content-script
+    // load or pagehide. Dedup by event_id at the backend keeps retries safe.
+    const sameTab = link_kind === "external" &&
+                    !modifiers.includes("middle") &&
+                    !modifiers.includes("meta") &&
+                    !modifiers.includes("ctrl") &&
+                    linkEl.target !== "_blank";
+    if (sameTab) {
+      try {
+        const pending = JSON.parse(sessionStorage.getItem(LINK_FALLBACK_KEY) || "[]");
+        pending.push(payload);
+        sessionStorage.setItem(LINK_FALLBACK_KEY, JSON.stringify(pending.slice(-50)));
+      } catch (_) {}
+    }
+    send(payload);
+  }
+
+  function drainPendingLinks() {
+    let pending;
+    try {
+      pending = JSON.parse(sessionStorage.getItem(LINK_FALLBACK_KEY) || "[]");
+    } catch (_) {
+      pending = [];
+    }
+    if (!pending.length) return;
+    try {
+      sessionStorage.removeItem(LINK_FALLBACK_KEY);
+    } catch (_) {}
+    for (const ev of pending) send(ev); // event_id preserved → backend dedup
+  }
+
   document.addEventListener(
     "click",
     (ev) => {
       const t = ev.target;
       if (!(t instanceof Element)) return;
+      // 1) Link click? (Must run before interaction map — e.g. user-name is
+      // both an anchor and a profile_click. Link_click wins because it carries
+      // strictly more information; profile_click remains derivable from URL.)
+      const link = t.closest("a[href]");
+      if (link) handleLinkClick(ev, link);
+      // 2) Interaction selectors (like / retweet / reply / ...).
       for (const [action, sel] of INTERACTION_MAP) {
         const hit = t.closest(sel);
         if (!hit) continue;
@@ -224,34 +365,201 @@
     },
     true, // capture phase — some X elements stopPropagation on bubbles
   );
+  // Middle-click emits `auxclick`, not `click`. Capture those too so
+  // "open in new tab via middle button" is recorded.
+  document.addEventListener(
+    "auxclick",
+    (ev) => {
+      if (ev.button !== 1) return;
+      const t = ev.target;
+      if (!(t instanceof Element)) return;
+      const link = t.closest("a[href]");
+      if (link) handleLinkClick(ev, link);
+    },
+    true,
+  );
 
-  // --- Search URL detection ------------------------------------------------
+  // --- Text selections -----------------------------------------------------
+  let selectionTimer = null;
+  let lastEmittedSelection = "";
+
+  function currentSelectionTweetAndText() {
+    const sel = window.getSelection();
+    if (!sel || sel.isCollapsed) return null;
+    const text = sel.toString();
+    if (!text || text.trim().length < 10) return null;
+    const anchor = sel.anchorNode;
+    if (!anchor) return null;
+    const el = anchor.nodeType === 1 ? anchor : anchor.parentElement;
+    if (!el) return null;
+    const article = el.closest('article[data-testid="tweet"]');
+    if (!article) return null;
+    const link = article.querySelector('a[href*="/status/"]');
+    let tweet_id = null;
+    if (link) {
+      const m = (link.getAttribute("href") || "").match(/\/status\/(\d+)/);
+      tweet_id = m ? m[1] : null;
+    }
+    return { tweet_id, text: text.slice(0, SELECTION_MAX_CHARS) };
+  }
+
+  function emitSelection(via) {
+    const data = currentSelectionTweetAndText();
+    if (!data) return;
+    if (data.text === lastEmittedSelection) return;
+    lastEmittedSelection = data.text;
+    send({
+      type: "text_selection",
+      tweet_id: data.tweet_id,
+      text: data.text,
+      via,
+      timestamp: nowIso(),
+    });
+  }
+
+  document.addEventListener("selectionchange", () => {
+    if (selectionTimer) clearTimeout(selectionTimer);
+    selectionTimer = setTimeout(() => {
+      selectionTimer = null;
+      emitSelection("select");
+    }, SELECTION_DEBOUNCE_MS);
+  });
+  // Copy is the higher-signal event; emit immediately (and dedup against
+  // a pending selectionchange via lastEmittedSelection).
+  document.addEventListener("copy", () => {
+    if (selectionTimer) {
+      clearTimeout(selectionTimer);
+      selectionTimer = null;
+    }
+    emitSelection("copy");
+  });
+
+  // --- Scroll bursts -------------------------------------------------------
+  // Event-driven aggregation (NOT 1 Hz sampling). One row per burst, capturing
+  // start/end y, duration, and direction reversals. See plan §Performance.
+  let burst = null;
+  let burstTimer = null;
+
+  function closeBurst() {
+    if (!burst) return;
+    const b = burst;
+    burst = null;
+    if (burstTimer) {
+      clearTimeout(burstTimer);
+      burstTimer = null;
+    }
+    // Only emit if there was meaningful displacement.
+    if (Math.abs(b.endY - b.startY) < 50) return;
+    send({
+      type: "scroll_burst",
+      feed_source: b.feed,
+      started_at: new Date(b.startT).toISOString(),
+      ended_at: new Date(b.endT).toISOString(),
+      duration_ms: Math.max(0, Math.round(b.endT - b.startT)),
+      start_y: b.startY,
+      end_y: b.endY,
+      delta_y: b.endY - b.startY,
+      reversals_count: b.reversals,
+    });
+  }
+
+  window.addEventListener(
+    "scroll",
+    () => {
+      const y = window.scrollY;
+      const now = Date.now();
+      if (!burst) {
+        burst = {
+          startY: y,
+          endY: y,
+          startT: now,
+          endT: now,
+          lastY: y,
+          dir: 0,
+          reversals: 0,
+          feed: feedSourceFromPath(),
+        };
+      } else {
+        const dy = y - burst.lastY;
+        const d = dy === 0 ? burst.dir : (dy > 0 ? 1 : -1);
+        if (burst.dir !== 0 && d !== 0 && d !== burst.dir) {
+          burst.reversals += 1;
+          // Emit early on a large reversal — treat scroll-back as a distinct burst.
+          if (Math.abs(y - burst.startY) >= SCROLL_REVERSAL_THRESHOLD_PX) {
+            burst.endY = y;
+            burst.endT = now;
+            closeBurst();
+            return;
+          }
+        }
+        burst.dir = d || burst.dir;
+        burst.lastY = y;
+        burst.endY = y;
+        burst.endT = now;
+      }
+      if (burstTimer) clearTimeout(burstTimer);
+      burstTimer = setTimeout(closeBurst, SCROLL_QUIESCENT_MS);
+    },
+    { passive: true },
+  );
+
+  // --- Search + nav + media (SPA URL observation) --------------------------
+  // One handler, zero new listeners on X's DOM. Piggybacks on the history API
+  // patch below to catch SPA navigation. Three event types derived from the
+  // path change: search (existing), nav_change (new), media_open (new).
   let lastSearch = "";
-  function checkSearch() {
+  let lastPath = location.pathname + location.search;
+  const MEDIA_RE = /^\/[^/]+\/status\/(\d+)\/(photo|video)\/(\d+)/;
+
+  function checkSearchAndNav() {
+    const pathBefore = lastPath;
+    const newPath = location.pathname + location.search;
+    // 1) Search queries (existing behavior, preserved verbatim).
     if (location.pathname !== "/search") {
       lastSearch = "";
-      return;
+    } else {
+      const q = new URLSearchParams(location.search).get("q") || "";
+      if (q && q !== lastSearch) {
+        lastSearch = q;
+        send({ type: "search", query: q, timestamp: nowIso() });
+      }
     }
-    const q = new URLSearchParams(location.search).get("q") || "";
-    if (q && q !== lastSearch) {
-      lastSearch = q;
-      send({ type: "search", query: q, timestamp: nowIso() });
+    // 2) Nav changes — any path change within X.
+    if (newPath !== pathBefore) {
+      // Parse the non-query path for feed_source classification.
+      const feedBefore = feedSourceFromPath(pathBefore.split("?")[0]);
+      const feedAfter = feedSourceFromPath(location.pathname);
+      send({
+        type: "nav_change",
+        from_path: pathBefore,
+        to_path: newPath,
+        feed_source_before: feedBefore,
+        feed_source_after: feedAfter,
+        timestamp: nowIso(),
+      });
+      lastPath = newPath;
+    }
+    // 3) Media lightbox opens — /status/{id}/photo|video/{n}.
+    const m = location.pathname.match(MEDIA_RE);
+    if (m) {
+      send({
+        type: "media_open",
+        tweet_id: m[1],
+        media_kind: m[2] === "photo" ? "image" : "video",
+        media_index: parseInt(m[3], 10),
+        timestamp: nowIso(),
+      });
     }
   }
-  // Monkey-patch history API to catch SPA navigation.
-  const origPush = history.pushState;
-  const origReplace = history.replaceState;
-  history.pushState = function () {
-    const r = origPush.apply(this, arguments);
-    setTimeout(checkSearch, 10);
-    return r;
-  };
-  history.replaceState = function () {
-    const r = origReplace.apply(this, arguments);
-    setTimeout(checkSearch, 10);
-    return r;
-  };
-  window.addEventListener("popstate", () => setTimeout(checkSearch, 10));
-  window.addEventListener("load", checkSearch);
-  checkSearch();
+  // history.pushState / replaceState is patched in injected.js (MAIN world) —
+  // an isolated-world patch here would be dead code, since X.com's SPA router
+  // calls pushState from MAIN world and each world has its own prototype chain.
+  // popstate fires as a real browser event, so the listener below crosses worlds.
+  window.addEventListener("popstate", () => setTimeout(checkSearchAndNav, 10));
+  window.addEventListener("load", () => {
+    drainPendingLinks();
+    checkSearchAndNav();
+  });
+  drainPendingLinks();
+  checkSearchAndNav();
 })();
