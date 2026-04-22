@@ -146,7 +146,7 @@ def top_authors_by_dwell(db: sqlite3.Connection, day_start: str, day_end: str, l
     return [dict(r) for r in cur.fetchall()]
 
 
-def threads_rows(db: sqlite3.Connection, day_start: str, day_end: str, min_tweets: int = 3) -> list[dict]:
+def threads_rows(db: sqlite3.Connection, day_start: str, day_end: str, min_tweets: int = 2) -> list[dict]:
     # Conversations with >= min_tweets distinct tweets seen this day, ordered.
     cur = db.execute(
         """
@@ -371,6 +371,93 @@ def session_timeline(db: sqlite3.Connection, day_start: str, day_end: str) -> li
     """
     params = (day_start, day_end) * 8
     cur = db.execute(q, params)
+    return [dict(r) for r in cur.fetchall()]
+
+
+def unique_tweets_with_engagement(
+    db: sqlite3.Connection, day_start: str, day_end: str
+) -> list[dict]:
+    """One row per unique tweet seen today — aggregated across all impressions.
+
+    Fields include impressions_count, total_dwell_ms, sessions_hit (CSV),
+    latest engagement snapshot, rich tweet metadata (media, conversation,
+    reply chain), author context, and a flag for whether the user
+    interacted with the tweet today. This is the canonical input for
+    importance scoring, repeat-exposure flagging, topic rollups, and the
+    TL;DR digest.
+
+    Ordered by impressions_count DESC then total_dwell_ms DESC so the
+    noisiest/most-dwelled tweets surface first; callers typically re-sort
+    by importance score which is computed in Python (scoring.importance).
+    """
+    cur = db.execute(
+        """
+        SELECT
+            t.tweet_id,
+            t.text,
+            t.lang,
+            t.conversation_id,
+            t.media_json,
+            t.reply_to_tweet_id,
+            t.quoted_tweet_id,
+            t.retweeted_tweet_id,
+            a.handle,
+            a.display_name,
+            a.user_id AS author_id,
+            a.follower_count,
+            a.verified,
+            COUNT(i.id) AS impressions_count,
+            COALESCE(SUM(i.dwell_ms), 0) AS total_dwell_ms,
+            GROUP_CONCAT(DISTINCT i.session_id) AS sessions_hit_csv,
+            MIN(i.first_seen_at) AS first_seen_at,
+            (SELECT likes FROM engagement_snapshots e WHERE e.tweet_id = t.tweet_id ORDER BY e.id DESC LIMIT 1) AS likes,
+            (SELECT retweets FROM engagement_snapshots e WHERE e.tweet_id = t.tweet_id ORDER BY e.id DESC LIMIT 1) AS retweets,
+            (SELECT replies FROM engagement_snapshots e WHERE e.tweet_id = t.tweet_id ORDER BY e.id DESC LIMIT 1) AS replies,
+            (SELECT views FROM engagement_snapshots e WHERE e.tweet_id = t.tweet_id ORDER BY e.id DESC LIMIT 1) AS views,
+            EXISTS (
+                SELECT 1 FROM my_interactions mi
+                WHERE mi.tweet_id = t.tweet_id
+                  AND mi.timestamp >= ? AND mi.timestamp < ?
+            ) AS user_had_interaction
+        FROM impressions i
+        JOIN tweets t ON i.tweet_id = t.tweet_id
+        LEFT JOIN authors a ON t.author_id = a.user_id
+        WHERE i.first_seen_at >= ? AND i.first_seen_at < ?
+        GROUP BY t.tweet_id
+        ORDER BY impressions_count DESC, total_dwell_ms DESC
+        """,
+        (day_start, day_end, day_start, day_end),
+    )
+    return [dict(r) for r in cur.fetchall()]
+
+
+def author_context_rows(
+    db: sqlite3.Connection, day_start: str, day_end: str
+) -> list[dict]:
+    """Top authors seen today, enriched with follower_count and verified flag
+    plus impression + unique-tweet + total-dwell aggregates. Feeds the v2
+    Authors section with real context ('who is this person who keeps showing
+    up in my feed?')."""
+    cur = db.execute(
+        """
+        SELECT
+            a.handle,
+            a.user_id,
+            a.display_name,
+            a.follower_count,
+            a.verified,
+            COUNT(i.id) AS impressions_count,
+            COUNT(DISTINCT i.tweet_id) AS unique_tweets,
+            COALESCE(SUM(i.dwell_ms), 0) AS total_dwell_ms
+        FROM impressions i
+        JOIN tweets t ON i.tweet_id = t.tweet_id
+        JOIN authors a ON t.author_id = a.user_id
+        WHERE i.first_seen_at >= ? AND i.first_seen_at < ?
+        GROUP BY a.user_id
+        ORDER BY impressions_count DESC, total_dwell_ms DESC
+        """,
+        (day_start, day_end),
+    )
     return [dict(r) for r in cur.fetchall()]
 
 
