@@ -265,31 +265,45 @@ async def _handle_interaction(db: aiosqlite.Connection, event: dict, now: str) -
 
 
 async def _handle_dom_tweet(db: aiosqlite.Connection, event: dict, now: str) -> None:
-    """Minimal tweet record extracted from DOM when GraphQL interception missed it.
-    Fills in text, handle, display_name on stub tweet rows. Idempotent.
-    Accepts both full keys (author_handle, author_display) and short aliases (ah, ad)
-    for transport layers that strip sensitive-looking field names."""
+    """Full tweet record extracted from the rendered DOM — the primary capture
+    path in DOM-only mode. Includes author, text, timestamp, engagement counts,
+    media, and quote linkage. Idempotent (upserts).
+    Accepts both full keys (author_handle, author_display) and short aliases
+    (ah, ad) for transport layers that strip sensitive-looking field names."""
     tweet_id = event.get("tweet_id")
     handle = event.get("author_handle") or event.get("ah")
     if not tweet_id or not handle:
         raise ValueError("dom_tweet missing tweet_id or author handle")
     # Stable pseudo user_id for DOM-only authors (prefixed so we don't collide
-    # with real numeric Twitter user IDs).
+    # with real numeric Twitter user IDs from historical GraphQL rows).
     user_id = f"dom-{handle.lower()}"
     await _upsert_author(db, {
         "user_id": user_id,
         "handle": handle,
         "display_name": event.get("author_display") or event.get("ad"),
     }, now)
-    created_iso = event.get("created_at_iso")
-    # ISO datetime string passes straight through; leave as-is
     await _upsert_tweet(db, {
         "tweet_id": tweet_id,
         "author_id": user_id,
         "text": event.get("text"),
-        "created_at": created_iso,
+        "created_at": event.get("created_at_iso"),
         "conversation_id": event.get("conversation_id") or tweet_id,
+        "quoted_tweet_id": event.get("quoted_tweet_id"),
+        "media_json": event.get("media_json"),
     }, now)
+    # Engagement snapshot: insert when at least one count was observed. Uses
+    # the same 5-minute dedup as GraphQL-sourced snapshots.
+    if any(
+        event.get(k) is not None
+        for k in ("like_count", "retweet_count", "reply_count", "view_count")
+    ):
+        await _insert_engagement(db, {
+            "tweet_id": tweet_id,
+            "likes": event.get("like_count"),
+            "retweets": event.get("retweet_count"),
+            "replies": event.get("reply_count"),
+            "views": event.get("view_count"),
+        }, now)
 
 
 async def _handle_graphql_template(db: aiosqlite.Connection, event: dict, now: str) -> None:

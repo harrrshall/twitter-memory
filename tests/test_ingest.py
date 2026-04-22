@@ -362,6 +362,67 @@ async def test_relationship_change_happy_path(tmp_data_dir):
     await db.close()
 
 
+async def test_dom_tweet_full_record(tmp_data_dir):
+    # DOM-only path: single event should populate tweets, authors, and an
+    # engagement_snapshots row in one shot.
+    from backend.db import init_db, connect
+    await init_db()
+    db = await connect()
+    r = await _ingest(db, [{
+        "type": "dom_tweet",
+        "tweet_id": "9001",
+        "author_handle": "alice",
+        "author_display": "Alice A.",
+        "text": "hello world",
+        "created_at_iso": "2026-04-22T09:00:00.000Z",
+        "like_count": 12,
+        "retweet_count": 3,
+        "reply_count": 1,
+        "media_json": '[{"type":"image","url":"https://pbs.twimg.com/media/x.jpg"}]',
+        "quoted_tweet_id": "8000",
+    }])
+    assert r["accepted"] == 1, r
+    tweet = await (await db.execute(
+        "SELECT author_id, text, media_json, quoted_tweet_id FROM tweets WHERE tweet_id = '9001'"
+    )).fetchone()
+    assert tweet["author_id"] == "dom-alice"
+    assert tweet["text"] == "hello world"
+    assert tweet["quoted_tweet_id"] == "8000"
+    assert "pbs.twimg.com" in tweet["media_json"]
+    author = await (await db.execute(
+        "SELECT handle, display_name FROM authors WHERE user_id = 'dom-alice'"
+    )).fetchone()
+    assert author["handle"] == "alice"
+    assert author["display_name"] == "Alice A."
+    snap = await (await db.execute(
+        "SELECT likes, retweets, replies FROM engagement_snapshots WHERE tweet_id = '9001'"
+    )).fetchone()
+    assert snap["likes"] == 12
+    assert snap["retweets"] == 3
+    assert snap["replies"] == 1
+    await db.close()
+
+
+async def test_dom_tweet_no_engagement_skips_snapshot(tmp_data_dir):
+    # A dom_tweet without any counts (e.g., a stub where aria-labels hadn't
+    # hydrated yet) must still land the tweet row, but not create a bogus
+    # all-null engagement snapshot.
+    from backend.db import init_db, connect
+    await init_db()
+    db = await connect()
+    r = await _ingest(db, [{
+        "type": "dom_tweet",
+        "tweet_id": "9002",
+        "author_handle": "bob",
+    }])
+    assert r["accepted"] == 1
+    n = await (await db.execute(
+        "SELECT COUNT(*) AS c FROM engagement_snapshots WHERE tweet_id = '9002'"
+    )).fetchone()
+    assert n["c"] == 0
+    await db.close()
+
+
 async def test_relationship_change_missing_fields_rejected(tmp_data_dir):
     from backend.db import init_db, connect
     await init_db()
