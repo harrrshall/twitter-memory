@@ -572,9 +572,9 @@ def render_tldr(
         f"from {authors_n} author{'s' if authors_n != 1 else ''}.**"
     )
     if action_bits:
-        headline = headline[:-3] + f" Actions: {', '.join(action_bits)}.**"
+        headline = headline[:-3] + f". Actions: {', '.join(action_bits)}.**"
     else:
-        headline = headline[:-3] + " No interactions, no searches.**"
+        headline = headline[:-3] + ". No interactions, no searches.**"
     lines.append(headline)
 
     if top_topics:
