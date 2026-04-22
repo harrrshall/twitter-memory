@@ -217,3 +217,90 @@ CREATE TABLE IF NOT EXISTS relationship_changes (
   timestamp TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_rel_time ON relationship_changes(timestamp);
+
+-- Sprint 2 — antibot-safe behavioral signals (no outbound Twitter traffic).
+
+-- Tab visibility + window focus transitions. Four states:
+--   visible | hidden       (document.visibilityState)
+--   focused | blurred      (window focus/blur)
+-- Gives the agent a way to distinguish "read on screen" from "tab in bg".
+CREATE TABLE IF NOT EXISTS window_state_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id TEXT REFERENCES sessions(session_id),
+  state TEXT NOT NULL,
+  timestamp TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_winstate_time    ON window_state_events(timestamp);
+CREATE INDEX IF NOT EXISTS idx_winstate_session ON window_state_events(session_id, timestamp);
+
+-- "Almost clicked": the cursor hovered over a like / retweet / reply / bookmark
+-- button for dwell_ms and left without clicking. The extension filters below
+-- the 200ms floor client-side to avoid accidental mouse pass-through. Actions
+-- where the user did click produce a normal `interaction` event instead and
+-- do NOT land here (content-script suppresses emit within 500ms of a click on
+-- the same button).
+CREATE TABLE IF NOT EXISTS button_hover_intent (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id TEXT REFERENCES sessions(session_id),
+  tweet_id TEXT REFERENCES tweets(tweet_id),
+  action TEXT NOT NULL,
+  dwell_ms INTEGER NOT NULL,
+  timestamp TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_hoverintent_time    ON button_hover_intent(timestamp);
+CREATE INDEX IF NOT EXISTS idx_hoverintent_tweet   ON button_hover_intent(tweet_id);
+CREATE INDEX IF NOT EXISTS idx_hoverintent_session ON button_hover_intent(session_id, timestamp);
+
+-- Sprint 3 — deeper workflow capture (still antibot-safe).
+
+-- Cursor movement within a single tweet's bounding box, aggregated from 100ms-
+-- throttled mousemove samples. One row per impression of a tweet. `points_json`
+-- is a compact array of [x, y, t] tuples where x/y are 0..1 relative to the
+-- article box and t is ms since impression_start. Capped at 200 points server-side.
+CREATE TABLE IF NOT EXISTS cursor_trails (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id TEXT REFERENCES sessions(session_id),
+  tweet_id TEXT REFERENCES tweets(tweet_id),
+  point_count INTEGER NOT NULL,
+  points_json TEXT NOT NULL,
+  first_seen_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_cursor_trail_time    ON cursor_trails(first_seen_at);
+CREATE INDEX IF NOT EXISTS idx_cursor_trail_tweet   ON cursor_trails(tweet_id);
+CREATE INDEX IF NOT EXISTS idx_cursor_trail_session ON cursor_trails(session_id, first_seen_at);
+
+-- Play / pause / ended / seeked events on any <video> inside a tweet.
+-- `current_time` and `duration` are seconds as reported by HTMLVideoElement.
+-- `timeupdate` is throttled to one event per 500ms client-side to avoid an
+-- event flood during playback.
+CREATE TABLE IF NOT EXISTS video_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id TEXT REFERENCES sessions(session_id),
+  tweet_id TEXT REFERENCES tweets(tweet_id),
+  media_index INTEGER,
+  event_type TEXT NOT NULL,
+  current_time_s REAL,  -- seconds; not named current_time because that's a SQLite built-in
+  duration_s REAL,
+  timestamp TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_video_events_time    ON video_events(timestamp);
+CREATE INDEX IF NOT EXISTS idx_video_events_tweet   ON video_events(tweet_id);
+CREATE INDEX IF NOT EXISTS idx_video_events_session ON video_events(session_id, timestamp);
+
+-- Sprint 5 — privacy-sensitive compose-box activity.
+-- Default capture = counts only. Actual draft text lands in text_final ONLY
+-- when the user opted in via the `captureDraftText` popup toggle. `discarded`
+-- is true when the user closed/blurred the composer without submitting.
+CREATE TABLE IF NOT EXISTS draft_activity (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id TEXT REFERENCES sessions(session_id),
+  keystroke_count INTEGER NOT NULL,
+  char_count_final INTEGER NOT NULL,
+  delete_count INTEGER NOT NULL,
+  duration_ms INTEGER NOT NULL,
+  discarded INTEGER NOT NULL,
+  text_final TEXT,
+  timestamp TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_draft_time    ON draft_activity(timestamp);
+CREATE INDEX IF NOT EXISTS idx_draft_session ON draft_activity(session_id, timestamp);

@@ -56,14 +56,23 @@ async function refresh() {
   } catch (e) {
     setBackendState("bad");
   }
-  const sync = await chrome.storage.sync.get("captureEnabled");
+  const sync = await chrome.storage.sync.get(["captureEnabled", "captureDraftText"]);
   const captureEnabled = sync.captureEnabled !== false;
+  const captureDraftText = sync.captureDraftText === true;
   document.getElementById("cap").textContent = captureEnabled ? "on" : "off";
+  const draftEl = document.getElementById("draft-state");
+  if (draftEl) draftEl.textContent = captureDraftText ? "on" : "off";
 }
 
 document.getElementById("toggle").addEventListener("click", async () => {
   const { captureEnabled = true } = await chrome.storage.sync.get("captureEnabled");
   await chrome.storage.sync.set({ captureEnabled: !captureEnabled });
+  refresh();
+});
+
+document.getElementById("toggle-draft-text")?.addEventListener("click", async () => {
+  const { captureDraftText = false } = await chrome.storage.sync.get("captureDraftText");
+  await chrome.storage.sync.set({ captureDraftText: !captureDraftText });
   refresh();
 });
 

@@ -433,6 +433,343 @@ async def test_relationship_change_missing_fields_rejected(tmp_data_dir):
     await db.close()
 
 
+async def test_window_state_happy_path(tmp_data_dir):
+    from backend.db import init_db, connect
+    await init_db()
+    db = await connect()
+    r = await _ingest(db, [
+        {"type": "window_state", "session_id": "s1",
+         "state": "focused", "timestamp": "2026-04-22T10:00:00+00:00"},
+        {"type": "window_state", "session_id": "s1",
+         "state": "hidden", "timestamp": "2026-04-22T10:05:00+00:00"},
+    ])
+    assert r["accepted"] == 2, r
+    rows = [dict(row) for row in await (await db.execute(
+        "SELECT state, timestamp FROM window_state_events ORDER BY timestamp"
+    )).fetchall()]
+    assert [r["state"] for r in rows] == ["focused", "hidden"]
+    await db.close()
+
+
+async def test_window_state_rejects_unknown_state(tmp_data_dir):
+    from backend.db import init_db, connect
+    await init_db()
+    db = await connect()
+    r = await _ingest(db, [
+        {"type": "window_state", "state": "bogus",
+         "timestamp": "2026-04-22T10:00:00+00:00"},
+    ])
+    assert r["accepted"] == 0
+    assert "invalid state" in r["errors"][0]["error"]
+    await db.close()
+
+
+async def test_button_hover_intent_happy_path(tmp_data_dir):
+    from backend.db import init_db, connect
+    await init_db()
+    db = await connect()
+    r = await _ingest(db, [{
+        "type": "button_hover_intent",
+        "session_id": "s1",
+        "tweet_id": "9100",
+        "action": "like",
+        "dwell_ms": 1250,
+        "timestamp": "2026-04-22T10:00:00+00:00",
+    }])
+    assert r["accepted"] == 1, r
+    row = await (await db.execute(
+        "SELECT tweet_id, action, dwell_ms FROM button_hover_intent"
+    )).fetchone()
+    assert row["tweet_id"] == "9100"
+    assert row["action"] == "like"
+    assert row["dwell_ms"] == 1250
+    await db.close()
+
+
+async def test_button_hover_intent_rejects_bad_action(tmp_data_dir):
+    from backend.db import init_db, connect
+    await init_db()
+    db = await connect()
+    r = await _ingest(db, [{
+        "type": "button_hover_intent",
+        "tweet_id": "9101",
+        "action": "follow",  # not a valid engagement action
+        "dwell_ms": 300,
+        "timestamp": "2026-04-22T10:00:00+00:00",
+    }])
+    assert r["accepted"] == 0
+    assert "invalid action" in r["errors"][0]["error"]
+    await db.close()
+
+
+async def test_button_hover_intent_rejects_negative_dwell(tmp_data_dir):
+    from backend.db import init_db, connect
+    await init_db()
+    db = await connect()
+    r = await _ingest(db, [{
+        "type": "button_hover_intent",
+        "tweet_id": "9102",
+        "action": "retweet",
+        "dwell_ms": -1,
+        "timestamp": "2026-04-22T10:00:00+00:00",
+    }])
+    assert r["accepted"] == 0
+    assert "dwell_ms" in r["errors"][0]["error"]
+    await db.close()
+
+
+async def test_cursor_trail_happy_path(tmp_data_dir):
+    from backend.db import init_db, connect
+    await init_db()
+    db = await connect()
+    points = [[0.1, 0.2, 0], [0.15, 0.25, 100], [0.2, 0.3, 200]]
+    r = await _ingest(db, [{
+        "type": "cursor_trail",
+        "session_id": "s1",
+        "tweet_id": "9300",
+        "points": points,
+        "first_seen_at": "2026-04-22T10:00:00+00:00",
+    }])
+    assert r["accepted"] == 1, r
+    row = await (await db.execute(
+        "SELECT tweet_id, point_count, points_json FROM cursor_trails"
+    )).fetchone()
+    assert row["tweet_id"] == "9300"
+    assert row["point_count"] == 3
+    import json as _json
+    parsed = _json.loads(row["points_json"])
+    assert parsed[0] == [0.1, 0.2, 0.0]
+    await db.close()
+
+
+async def test_cursor_trail_clamps_and_truncates(tmp_data_dir):
+    """Out-of-range coords get clamped to [0,1]; > 200 points get truncated."""
+    from backend.db import init_db, connect
+    from backend.ingest import _CURSOR_TRAIL_MAX_POINTS
+    await init_db()
+    db = await connect()
+    big = [[-0.5, 2.0, i * 50] for i in range(300)]
+    r = await _ingest(db, [{
+        "type": "cursor_trail",
+        "session_id": "s1",
+        "tweet_id": "9301",
+        "points": big,
+        "first_seen_at": "2026-04-22T10:00:00+00:00",
+    }])
+    assert r["accepted"] == 1
+    row = await (await db.execute(
+        "SELECT point_count, points_json FROM cursor_trails WHERE tweet_id = '9301'"
+    )).fetchone()
+    assert row["point_count"] == _CURSOR_TRAIL_MAX_POINTS
+    import json as _json
+    parsed = _json.loads(row["points_json"])
+    # Values clamped to [0, 1]
+    for x, y, _t in parsed:
+        assert 0 <= x <= 1
+        assert 0 <= y <= 1
+    await db.close()
+
+
+async def test_cursor_trail_rejects_empty_points(tmp_data_dir):
+    from backend.db import init_db, connect
+    await init_db()
+    db = await connect()
+    r = await _ingest(db, [{
+        "type": "cursor_trail",
+        "tweet_id": "9302",
+        "points": [],
+        "first_seen_at": "2026-04-22T10:00:00+00:00",
+    }])
+    assert r["accepted"] == 0
+    assert "points" in r["errors"][0]["error"]
+    await db.close()
+
+
+async def test_cursor_trail_rejects_all_invalid_points(tmp_data_dir):
+    """Malformed point tuples all get dropped; handler raises when nothing
+    survives validation rather than inserting an empty row."""
+    from backend.db import init_db, connect
+    await init_db()
+    db = await connect()
+    r = await _ingest(db, [{
+        "type": "cursor_trail",
+        "tweet_id": "9303",
+        "points": [["a", "b", "c"], [1, 2]],  # non-numeric and wrong arity
+        "first_seen_at": "2026-04-22T10:00:00+00:00",
+    }])
+    assert r["accepted"] == 0
+    await db.close()
+
+
+async def test_video_event_play_pause(tmp_data_dir):
+    from backend.db import init_db, connect
+    await init_db()
+    db = await connect()
+    r = await _ingest(db, [
+        {"type": "video_event", "session_id": "s1", "tweet_id": "9400",
+         "media_index": 0, "event_type": "play",
+         "current_time": 0.0, "duration": 12.3,
+         "timestamp": "2026-04-22T10:00:00+00:00"},
+        {"type": "video_event", "session_id": "s1", "tweet_id": "9400",
+         "media_index": 0, "event_type": "pause",
+         "current_time": 5.7, "duration": 12.3,
+         "timestamp": "2026-04-22T10:00:06+00:00"},
+    ])
+    assert r["accepted"] == 2, r
+    rows = await (await db.execute(
+        "SELECT event_type, current_time_s, duration_s FROM video_events ORDER BY id"
+    )).fetchall()
+    assert [row["event_type"] for row in rows] == ["play", "pause"]
+    assert rows[1]["current_time_s"] == 5.7
+    await db.close()
+
+
+async def test_draft_activity_counts_only(tmp_data_dir):
+    """Default ingest path: counts only, no text field."""
+    from backend.db import init_db, connect
+    await init_db()
+    db = await connect()
+    r = await _ingest(db, [{
+        "type": "draft_activity",
+        "session_id": "s1",
+        "keystroke_count": 42,
+        "char_count_final": 25,
+        "delete_count": 17,
+        "duration_ms": 4500,
+        "discarded": False,
+        "timestamp": "2026-04-22T10:00:00+00:00",
+    }])
+    assert r["accepted"] == 1, r
+    row = await (await db.execute(
+        "SELECT keystroke_count, char_count_final, delete_count, "
+        "duration_ms, discarded, text_final FROM draft_activity"
+    )).fetchone()
+    assert row["keystroke_count"] == 42
+    assert row["delete_count"] == 17
+    assert row["discarded"] == 0  # False → 0
+    assert row["text_final"] is None
+    await db.close()
+
+
+async def test_draft_activity_with_opt_in_text(tmp_data_dir):
+    from backend.db import init_db, connect
+    await init_db()
+    db = await connect()
+    r = await _ingest(db, [{
+        "type": "draft_activity",
+        "session_id": "s1",
+        "keystroke_count": 10,
+        "char_count_final": 8,
+        "delete_count": 2,
+        "duration_ms": 3000,
+        "discarded": True,
+        "text_final": "my draft",
+        "timestamp": "2026-04-22T10:00:00+00:00",
+    }])
+    assert r["accepted"] == 1
+    row = await (await db.execute(
+        "SELECT discarded, text_final FROM draft_activity"
+    )).fetchone()
+    assert row["discarded"] == 1
+    assert row["text_final"] == "my draft"
+    await db.close()
+
+
+async def test_draft_activity_caps_long_text(tmp_data_dir):
+    from backend.db import init_db, connect
+    from backend.ingest import _DRAFT_TEXT_MAX_CHARS
+    await init_db()
+    db = await connect()
+    long_text = "x" * (_DRAFT_TEXT_MAX_CHARS + 5000)
+    r = await _ingest(db, [{
+        "type": "draft_activity",
+        "keystroke_count": 1,
+        "char_count_final": len(long_text),
+        "delete_count": 0,
+        "duration_ms": 1000,
+        "discarded": False,
+        "text_final": long_text,
+        "timestamp": "2026-04-22T10:00:00+00:00",
+    }])
+    assert r["accepted"] == 1
+    row = await (await db.execute(
+        "SELECT LENGTH(text_final) AS n FROM draft_activity"
+    )).fetchone()
+    assert row["n"] == _DRAFT_TEXT_MAX_CHARS
+    await db.close()
+
+
+async def test_draft_activity_rejects_invalid(tmp_data_dir):
+    from backend.db import init_db, connect
+    await init_db()
+    db = await connect()
+    # Missing discarded
+    r = await _ingest(db, [{
+        "type": "draft_activity",
+        "keystroke_count": 5,
+        "char_count_final": 3,
+        "delete_count": 0,
+        "duration_ms": 500,
+        "timestamp": "2026-04-22T10:00:00+00:00",
+    }])
+    assert r["accepted"] == 0
+    assert "discarded" in r["errors"][0]["error"]
+    # Negative count
+    r2 = await _ingest(db, [{
+        "type": "draft_activity",
+        "keystroke_count": -1,
+        "char_count_final": 0,
+        "delete_count": 0,
+        "duration_ms": 0,
+        "discarded": False,
+        "timestamp": "2026-04-22T10:00:00+00:00",
+    }])
+    assert r2["accepted"] == 0
+    assert "keystroke_count" in r2["errors"][0]["error"]
+    await db.close()
+
+
+async def test_video_event_rejects_bad_type(tmp_data_dir):
+    from backend.db import init_db, connect
+    await init_db()
+    db = await connect()
+    r = await _ingest(db, [{
+        "type": "video_event", "tweet_id": "9401",
+        "event_type": "explode",  # not in _VIDEO_EVENT_TYPES
+        "timestamp": "2026-04-22T10:00:00+00:00",
+    }])
+    assert r["accepted"] == 0
+    assert "invalid event_type" in r["errors"][0]["error"]
+    await db.close()
+
+
+async def test_hesitation_report_returns_rows_after_ingest(tmp_data_dir, monkeypatch):
+    """End-to-end: after Sprint 2 hover events land, hesitation_report returns
+    them rather than the Sprint-1 empty fallback."""
+    monkeypatch.setenv("TZ", "UTC")
+    monkeypatch.setenv("TWITTER_MEMORY_TZ", "UTC")
+    import importlib
+    import mcp_server.settings
+    importlib.reload(mcp_server.settings)
+    from backend.db import init_db, connect
+    await init_db()
+    db = await connect()
+    await _ingest(db, [
+        {"type": "button_hover_intent", "session_id": "s1", "tweet_id": "9200",
+         "action": "like", "dwell_ms": 1500,
+         "timestamp": "2026-04-22T10:00:00+00:00"},
+        {"type": "button_hover_intent", "session_id": "s1", "tweet_id": "9201",
+         "action": "retweet", "dwell_ms": 150,  # below default filter
+         "timestamp": "2026-04-22T10:01:00+00:00"},
+    ])
+    await db.close()
+    from mcp_server import server
+    r = server.hesitation_report(start="2026-04-22", end="2026-04-22", min_dwell_ms=200)
+    assert r["row_count"] == 1
+    assert r["rows"][0]["tweet_id"] == "9200"
+    assert r["rows"][0]["almost_clicked"] == "like"
+
+
 async def test_v2_event_id_dedup(tmp_data_dir):
     # Same event_id for a link_click must not insert a second row.
     from backend.db import init_db, connect

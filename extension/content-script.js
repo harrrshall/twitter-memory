@@ -16,6 +16,9 @@
   const LINK_FALLBACK_KEY = "__tm_pending_link__";
   const NAV_POLL_MS = 250;
   const RELATIONSHIP_CONFIRM_MS = 2000;
+  const CURSOR_TRAIL_SAMPLE_MS = 100;   // max 10 samples / sec
+  const CURSOR_TRAIL_MAX_POINTS = 200;
+  const VIDEO_TIMEUPDATE_THROTTLE_MS = 500;
 
   // --- Helpers -------------------------------------------------------------
   function send(event) {
@@ -287,10 +290,12 @@
           rec = {
             id: tweet_id,
             firstSeenAt: nowIso(),
+            startedAtPerf: now,   // baseline for cursor trail t_rel
             visibleSince: visible ? now : 0,
             totalDwell: 0,
             feed: feedSourceFromPath(),
             domEmitted: false,
+            trail: null,          // lazily-allocated cursor trail buffer
           };
           seenTweets.set(art, rec);
           // Tweet is in the DOM as soon as we observe it — emit the DOM
@@ -323,6 +328,116 @@
     io.observe(art);
   }
 
+  function emitCursorTrailIfAny(rec) {
+    if (!rec || !rec.trail || rec.trail.length < 3) {
+      if (rec) rec.trail = null;
+      return;
+    }
+    send({
+      type: "cursor_trail",
+      tweet_id: rec.id,
+      points: rec.trail,
+      first_seen_at: rec.firstSeenAt,
+      timestamp: nowIso(),
+    });
+    rec.trail = null;
+  }
+
+  // Cursor trail sampler: every ~100ms, if the cursor is over a tracked tweet,
+  // append [x_rel, y_rel, t_rel] to that tweet's buffer. Trail is emitted on
+  // impression_end so we never hold more than one tweet's worth of points
+  // unflushed per article.
+  let lastCursorSampleAt = 0;
+  document.addEventListener(
+    "pointermove",
+    (ev) => {
+      const now = performance.now();
+      if (now - lastCursorSampleAt < CURSOR_TRAIL_SAMPLE_MS) return;
+      const t = ev.target;
+      if (!(t instanceof Element)) return;
+      const art = t.closest('article[data-testid="tweet"]');
+      if (!art) return;
+      const rec = seenTweets.get(art);
+      if (!rec) return;
+      lastCursorSampleAt = now;
+      if (!rec.trail) rec.trail = [];
+      if (rec.trail.length >= CURSOR_TRAIL_MAX_POINTS) return;
+      const rect = art.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0) return;
+      const x_rel = (ev.clientX - rect.left) / rect.width;
+      const y_rel = (ev.clientY - rect.top) / rect.height;
+      if (x_rel < 0 || x_rel > 1 || y_rel < 0 || y_rel > 1) return;
+      rec.trail.push([
+        Math.round(x_rel * 1000) / 1000,
+        Math.round(y_rel * 1000) / 1000,
+        Math.round(now - rec.startedAtPerf),
+      ]);
+    },
+    { passive: true, capture: true },
+  );
+
+  // --- Video events --------------------------------------------------------
+  // A MutationObserver finds new <video> elements (Twitter lazily hydrates
+  // videos as tweets scroll into view) and attaches play/pause/ended/seeked
+  // listeners. `timeupdate` is throttled to VIDEO_TIMEUPDATE_THROTTLE_MS so a
+  // 60Hz playback event stream doesn't flood the ingest batcher.
+  function attachVideoListeners(video) {
+    if (video.dataset.__tm_video_wired) return;
+    video.dataset.__tm_video_wired = "1";
+    const art = video.closest('article[data-testid="tweet"]');
+    const tweet_id = art ? closestTweetId(art) : null;
+    if (!tweet_id) return;
+    // media_index: approximate by position of this <video> among siblings in
+    // the article. Sufficient for tweets with ≤1 video (the common case).
+    const siblings = art ? art.querySelectorAll("video") : [];
+    let media_index = 0;
+    siblings.forEach((v, i) => {
+      if (v === video) media_index = i;
+    });
+    let lastTimeupdateAt = 0;
+    const emit = (event_type) => {
+      const duration = Number.isFinite(video.duration) ? video.duration : null;
+      send({
+        type: "video_event",
+        tweet_id,
+        media_index,
+        event_type,
+        current_time: Number.isFinite(video.currentTime) ? video.currentTime : null,
+        duration,
+        timestamp: nowIso(),
+      });
+    };
+    video.addEventListener("play", () => emit("play"));
+    video.addEventListener("pause", () => emit("pause"));
+    video.addEventListener("ended", () => emit("ended"));
+    video.addEventListener("seeked", () => emit("seeked"));
+    video.addEventListener("timeupdate", () => {
+      const now = Date.now();
+      if (now - lastTimeupdateAt < VIDEO_TIMEUPDATE_THROTTLE_MS) return;
+      lastTimeupdateAt = now;
+      emit("timeupdate");
+    });
+  }
+  const videoObserver = new MutationObserver((muts) => {
+    for (const m of muts) {
+      for (const n of m.addedNodes) {
+        if (n.nodeType !== 1) continue;
+        if (n.tagName === "VIDEO") {
+          attachVideoListeners(n);
+          continue;
+        }
+        const vids = n.querySelectorAll?.("video") || [];
+        vids.forEach(attachVideoListeners);
+      }
+    }
+  });
+  videoObserver.observe(document.documentElement, {
+    childList: true,
+    subtree: true,
+  });
+  // Catch <video>s already in the DOM at content-script start.
+  document.querySelectorAll("video").forEach(attachVideoListeners);
+
   // Flush dwell when a tweet is removed from the DOM.
   const removeObserver = new MutationObserver((muts) => {
     for (const m of muts) {
@@ -345,6 +460,7 @@
             dwell_ms: Math.round(rec.totalDwell),
             feed_source: rec.feed,
           });
+          emitCursorTrailIfAny(rec);
           io.unobserve(art);
         }
       }
@@ -380,6 +496,7 @@
         dwell_ms: Math.round(rec.totalDwell),
         feed_source: rec.feed,
       });
+      emitCursorTrailIfAny(rec);
       // Prevent double-flush by marking as flushed.
       rec.totalDwell = 0;
     });
@@ -394,7 +511,15 @@
     drainPendingLinks();
   }
   document.addEventListener("visibilitychange", () => {
+    const state = document.visibilityState === "visible" ? "visible" : "hidden";
+    send({ type: "window_state", state, timestamp: nowIso() });
     if (document.visibilityState === "hidden") flushAll();
+  });
+  window.addEventListener("focus", () => {
+    send({ type: "window_state", state: "focused", timestamp: nowIso() });
+  });
+  window.addEventListener("blur", () => {
+    send({ type: "window_state", state: "blurred", timestamp: nowIso() });
   });
   window.addEventListener("pagehide", flushAll);
 
@@ -462,6 +587,86 @@
     for (const ev of pending) send(ev); // event_id preserved → backend dedup
   }
 
+  // Buttons that produce a `button_hover_intent` event when the cursor lingers
+  // without clicking. Subset of INTERACTION_MAP — profile_click / expand aren't
+  // real engagement actions.
+  const HOVER_INTENT_MAP = [
+    ["like", '[data-testid="like"], [data-testid="unlike"]'],
+    ["retweet", '[data-testid="retweet"], [data-testid="unretweet"]'],
+    ["reply", '[data-testid="reply"]'],
+    ["bookmark", '[data-testid="bookmark"], [data-testid="removeBookmark"]'],
+  ];
+  const BUTTON_HOVER_MIN_MS = 200;
+  const hoverJustClicked = new WeakSet();
+  let hoveredBtn = null;
+  let hoveredAction = null;
+  let hoveredTweetId = null;
+  let hoveredAt = 0;
+
+  function findHoverButton(el) {
+    if (!(el instanceof Element)) return null;
+    for (const [action, sel] of HOVER_INTENT_MAP) {
+      const btn = el.closest(sel);
+      if (btn) return { btn, action };
+    }
+    return null;
+  }
+
+  function finalizeHover() {
+    if (!hoveredBtn || !hoveredTweetId) {
+      hoveredBtn = null;
+      return;
+    }
+    if (hoverJustClicked.has(hoveredBtn)) {
+      hoverJustClicked.delete(hoveredBtn);
+      hoveredBtn = null;
+      return;
+    }
+    const dwell_ms = Math.round(performance.now() - hoveredAt);
+    if (dwell_ms >= BUTTON_HOVER_MIN_MS) {
+      send({
+        type: "button_hover_intent",
+        tweet_id: hoveredTweetId,
+        action: hoveredAction,
+        dwell_ms,
+        timestamp: nowIso(),
+      });
+    }
+    hoveredBtn = null;
+  }
+
+  // pointerover fires on both the button and its descendants (icon, text span).
+  // closest() collapses both cases to the same btn element — so "entering" is
+  // "we weren't on this btn before". pointerout fires likewise; we only
+  // finalize when the next target is OUTSIDE the button (relatedTarget check).
+  document.addEventListener(
+    "pointerover",
+    (ev) => {
+      const hit = findHoverButton(ev.target);
+      if (!hit) return;
+      if (hoveredBtn === hit.btn) return; // still inside same btn
+      finalizeHover(); // closes any prior hover
+      const tweet_id = closestTweetId(hit.btn);
+      if (!tweet_id) return;
+      hoveredBtn = hit.btn;
+      hoveredAction = hit.action;
+      hoveredTweetId = tweet_id;
+      hoveredAt = performance.now();
+    },
+    true,
+  );
+  document.addEventListener(
+    "pointerout",
+    (ev) => {
+      if (!hoveredBtn) return;
+      const related = ev.relatedTarget;
+      // Moving to a descendant of the same btn? Ignore.
+      if (related instanceof Element && hoveredBtn.contains(related)) return;
+      finalizeHover();
+    },
+    true,
+  );
+
   document.addEventListener(
     "click",
     (ev) => {
@@ -484,6 +689,11 @@
           tweet_id,
           timestamp: nowIso(),
         });
+        // Suppress the pending button_hover_intent emit on the next
+        // pointerout — the user committed, not hesitated.
+        if (["like", "retweet", "reply", "bookmark"].includes(action)) {
+          hoverJustClicked.add(hit);
+        }
         break;
       }
     },
@@ -686,6 +896,100 @@
   setInterval(checkSearchAndNav, NAV_POLL_MS);
   drainPendingLinks();
   checkSearchAndNav();
+
+  // --- Draft / compose activity (Sprint 5) --------------------------------
+  // Twitter's composer uses Draft.js contenteditable; data-testid starts with
+  // "tweetTextarea_". Track per-element: keystroke count, delete count,
+  // start/end time, final char count. On blur (or composer removal), emit a
+  // `draft_activity` event. Text content only goes in payload when the user
+  // opted in via the `captureDraftText` sync storage flag.
+  let captureDraftText = false;
+  try {
+    chrome.storage.sync.get("captureDraftText").then((r) => {
+      captureDraftText = r.captureDraftText === true;
+    });
+    chrome.storage.onChanged.addListener((changes, area) => {
+      if (area === "sync" && changes.captureDraftText) {
+        captureDraftText = changes.captureDraftText.newValue === true;
+      }
+    });
+  } catch (_) {
+    // content script not yet connected to the extension — default stays false.
+  }
+  const draftState = new WeakMap(); // element -> { keystrokes, deletes, startedAt }
+
+  function isComposer(el) {
+    if (!(el instanceof Element)) return false;
+    const testid = el.getAttribute("data-testid") || "";
+    return testid.startsWith("tweetTextarea_");
+  }
+
+  function getOrInitDraft(el) {
+    let s = draftState.get(el);
+    if (!s) {
+      s = { keystrokes: 0, deletes: 0, startedAt: Date.now(), lastTextLen: 0 };
+      draftState.set(el, s);
+    }
+    return s;
+  }
+
+  function finalizeDraft(el, { discarded }) {
+    const s = draftState.get(el);
+    if (!s) return;
+    draftState.delete(el);
+    const final = (el.textContent || "").trim();
+    const payload = {
+      type: "draft_activity",
+      keystroke_count: s.keystrokes,
+      char_count_final: final.length,
+      delete_count: s.deletes,
+      duration_ms: Math.max(0, Date.now() - s.startedAt),
+      discarded: !!discarded,
+      timestamp: nowIso(),
+    };
+    if (captureDraftText && final) {
+      payload.text_final = final;
+    }
+    // Suppress emits with zero keystrokes AND zero chars — empty composer opens
+    // shouldn't spam the DB.
+    if (payload.keystroke_count === 0 && payload.char_count_final === 0) return;
+    send(payload);
+  }
+
+  document.addEventListener(
+    "keydown",
+    (ev) => {
+      const t = ev.target;
+      if (!isComposer(t)) return;
+      const s = getOrInitDraft(t);
+      s.keystrokes++;
+      if (ev.key === "Backspace" || ev.key === "Delete") s.deletes++;
+    },
+    true,
+  );
+
+  // blurred composer = session end. Use capture so we beat any Twitter-side
+  // stopPropagation.
+  document.addEventListener(
+    "blur",
+    (ev) => {
+      if (!isComposer(ev.target)) return;
+      const empty = !((ev.target.textContent || "").trim());
+      // Empty-composer blurs = user opened but typed nothing / erased and
+      // left. That's a discard. Non-empty blurs are either submits or
+      // unfinished drafts; we can't distinguish cheaply, so mark non-empty
+      // as not discarded — a submit wipes the composer immediately.
+      finalizeDraft(ev.target, { discarded: empty });
+    },
+    true,
+  );
+  // Also finalize any open draft on page hide, to capture drafts the user
+  // abandoned by navigating away.
+  window.addEventListener("pagehide", () => {
+    document
+      .querySelectorAll('[data-testid^="tweetTextarea_"]')
+      .forEach((el) => finalizeDraft(el, { discarded: true }));
+  });
 
   // --- Relationship changes (follow / unfollow / mute / block) -------------
   // Twitter follow buttons carry data-testid of the form `{user_id}-follow`

@@ -499,6 +499,189 @@ async def _handle_nav_change(db: aiosqlite.Connection, event: dict, now: str) ->
     )
 
 
+async def _handle_window_state(db: aiosqlite.Connection, event: dict, now: str) -> None:
+    """Tab visibility / window focus transition. state is one of
+    visible|hidden|focused|blurred."""
+    state = event.get("state")
+    if state not in {"visible", "hidden", "focused", "blurred"}:
+        raise ValueError(f"window_state invalid state: {state!r}")
+    await _ensure_session_stub(db, event.get("session_id"), now)
+    await db.execute(
+        "INSERT INTO window_state_events (session_id, state, timestamp) "
+        "VALUES (?, ?, ?)",
+        (event.get("session_id"), state, event.get("timestamp") or now),
+    )
+
+
+async def _handle_button_hover_intent(db: aiosqlite.Connection, event: dict, now: str) -> None:
+    """Cursor hovered an engagement button without clicking. action is one of
+    like|retweet|reply|bookmark. dwell_ms is how long the cursor lingered."""
+    action = event.get("action")
+    tweet_id = event.get("tweet_id")
+    dwell = event.get("dwell_ms")
+    if action not in {"like", "retweet", "reply", "bookmark"}:
+        raise ValueError(f"button_hover_intent invalid action: {action!r}")
+    if not tweet_id:
+        raise ValueError("button_hover_intent missing tweet_id")
+    if not isinstance(dwell, int) or dwell < 0:
+        raise ValueError("button_hover_intent invalid dwell_ms")
+    await _ensure_tweet_stub(db, tweet_id, now)
+    await _ensure_session_stub(db, event.get("session_id"), now)
+    await db.execute(
+        "INSERT INTO button_hover_intent (session_id, tweet_id, action, dwell_ms, timestamp) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (
+            event.get("session_id"),
+            tweet_id,
+            action,
+            dwell,
+            event.get("timestamp") or now,
+        ),
+    )
+
+
+_CURSOR_TRAIL_MAX_POINTS = 200
+_VIDEO_EVENT_TYPES = {"play", "pause", "ended", "seeked", "timeupdate"}
+
+
+async def _handle_cursor_trail(db: aiosqlite.Connection, event: dict, now: str) -> None:
+    """Per-impression cursor trail within a tweet's bounding box.
+
+    Validates the points payload: array of [x, y, t] numeric tuples where
+    x/y ∈ [0, 1] (relative to the article box) and t >= 0 ms. Trails longer
+    than ``_CURSOR_TRAIL_MAX_POINTS`` are truncated at the server boundary
+    so a misbehaving client can't spam the row.
+    """
+    tweet_id = event.get("tweet_id")
+    if not tweet_id:
+        raise ValueError("cursor_trail missing tweet_id")
+    raw_points = event.get("points")
+    if not isinstance(raw_points, list) or not raw_points:
+        raise ValueError("cursor_trail missing points array")
+
+    clean: list[list[float]] = []
+    for p in raw_points[:_CURSOR_TRAIL_MAX_POINTS]:
+        if not isinstance(p, (list, tuple)) or len(p) != 3:
+            continue
+        try:
+            x, y, t = float(p[0]), float(p[1]), float(p[2])
+        except (TypeError, ValueError):
+            continue
+        # Clamp x/y to the tweet box. Drop negative times.
+        if t < 0:
+            continue
+        clean.append([
+            max(0.0, min(1.0, x)),
+            max(0.0, min(1.0, y)),
+            t,
+        ])
+    if not clean:
+        raise ValueError("cursor_trail: no valid points after validation")
+
+    await _ensure_tweet_stub(db, tweet_id, now)
+    await _ensure_session_stub(db, event.get("session_id"), now)
+    await db.execute(
+        """
+        INSERT INTO cursor_trails
+          (session_id, tweet_id, point_count, points_json, first_seen_at)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (
+            event.get("session_id"),
+            tweet_id,
+            len(clean),
+            json.dumps(clean, separators=(",", ":")),
+            event.get("first_seen_at") or event.get("timestamp") or now,
+        ),
+    )
+
+
+async def _handle_video_event(db: aiosqlite.Connection, event: dict, now: str) -> None:
+    """HTMLVideoElement event: play | pause | ended | seeked | timeupdate."""
+    event_type = event.get("event_type")
+    tweet_id = event.get("tweet_id")
+    if event_type not in _VIDEO_EVENT_TYPES:
+        raise ValueError(f"video_event invalid event_type: {event_type!r}")
+    if not tweet_id:
+        raise ValueError("video_event missing tweet_id")
+
+    def _num(x):
+        if x is None:
+            return None
+        try:
+            v = float(x)
+            return v if v >= 0 else None
+        except (TypeError, ValueError):
+            return None
+
+    await _ensure_tweet_stub(db, tweet_id, now)
+    await _ensure_session_stub(db, event.get("session_id"), now)
+    await db.execute(
+        """
+        INSERT INTO video_events
+          (session_id, tweet_id, media_index, event_type, current_time_s, duration_s, timestamp)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            event.get("session_id"),
+            tweet_id,
+            event.get("media_index"),
+            event_type,
+            _num(event.get("current_time")),
+            _num(event.get("duration")),
+            event.get("timestamp") or now,
+        ),
+    )
+
+
+_DRAFT_TEXT_MAX_CHARS = 5000
+
+
+async def _handle_draft_activity(db: aiosqlite.Connection, event: dict, now: str) -> None:
+    """Compose-box activity. Counts-only by default. `text_final` is stored
+    only when the extension sent it (user opted in via popup toggle)."""
+    def _nonneg_int(v, label: str) -> int:
+        if not isinstance(v, int) or v < 0:
+            raise ValueError(f"draft_activity invalid {label}: {v!r}")
+        return v
+
+    keystroke_count = _nonneg_int(event.get("keystroke_count"), "keystroke_count")
+    char_count_final = _nonneg_int(event.get("char_count_final"), "char_count_final")
+    delete_count = _nonneg_int(event.get("delete_count"), "delete_count")
+    duration_ms = _nonneg_int(event.get("duration_ms"), "duration_ms")
+    discarded_raw = event.get("discarded")
+    if not isinstance(discarded_raw, bool):
+        raise ValueError("draft_activity missing/invalid discarded")
+    discarded = 1 if discarded_raw else 0
+
+    text_final = event.get("text_final")
+    if text_final is not None:
+        if not isinstance(text_final, str):
+            raise ValueError("draft_activity text_final must be a string")
+        # Server-side cap as defense-in-depth against a misbehaving client.
+        text_final = text_final[:_DRAFT_TEXT_MAX_CHARS]
+
+    await _ensure_session_stub(db, event.get("session_id"), now)
+    await db.execute(
+        """
+        INSERT INTO draft_activity
+          (session_id, keystroke_count, char_count_final, delete_count,
+           duration_ms, discarded, text_final, timestamp)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            event.get("session_id"),
+            keystroke_count,
+            char_count_final,
+            delete_count,
+            duration_ms,
+            discarded,
+            text_final,
+            event.get("timestamp") or now,
+        ),
+    )
+
+
 async def _handle_relationship_change(db: aiosqlite.Connection, event: dict, now: str) -> None:
     action = event.get("action")
     target = event.get("target_user_id")
@@ -536,6 +719,11 @@ HANDLERS = {
     "scroll_burst": _handle_scroll_burst,
     "nav_change": _handle_nav_change,
     "relationship_change": _handle_relationship_change,
+    "window_state": _handle_window_state,
+    "button_hover_intent": _handle_button_hover_intent,
+    "cursor_trail": _handle_cursor_trail,
+    "video_event": _handle_video_event,
+    "draft_activity": _handle_draft_activity,
 }
 
 
