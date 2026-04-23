@@ -71,20 +71,33 @@ def _envelope(
 @mcp.tool(
     name="export_day",
     description=(
-        "Write a complete markdown + JSON report of one day's Twitter/X activity to "
-        f"{settings.EXPORTS_DIR}/YYYY-MM-DD.md (and .json) and return the file paths "
-        "plus inline markdown content.\n\n"
-        "Use this when you need the full narrative view of a day. For sliced queries "
-        "(search, top-dwelled, one author, one session) prefer the query tools instead — "
-        "they return 50 rows of JSON, not a 500KB markdown file.\n\n"
+        "Write one day's Twitter/X activity to a per-day directory under "
+        f"{settings.EXPORTS_DIR}/YYYY-MM-DD/ and return the paths plus the inline "
+        "digest markdown.\n\n"
+        "Layout written on disk:\n"
+        "- SCHEMA.md — shared interpretive guide (written once at the exports root).\n"
+        "- YYYY-MM-DD/digest.md — TL;DR + summary + topics + authors + threads. "
+        "Load this first when you need a fast human-readable scan.\n"
+        "- YYYY-MM-DD/tweets.md — ranked tweets + repeat-exposure. Load this to "
+        "answer 'what did the feed show me'.\n"
+        "- YYYY-MM-DD/activity.md — sessions + searches + interactions + link-outs + "
+        "selections + media. Load this to answer 'what did I do'.\n"
+        "- YYYY-MM-DD/timeline.md — chronological per-session event stream. Deep dive.\n"
+        "- YYYY-MM-DD/data.json — complete structured companion (tweets_ranked, "
+        "topics, authors, sessions, interactions, searches, link_outs, selections, "
+        "media, threads, repeat_exposure, impressions, revisits, timeline). Prefer "
+        "this over regex-ing the markdown.\n\n"
+        "For sliced queries (search, top-dwelled, one author, one session) prefer "
+        "the query tools — they return 50 rows of JSON, not a full day's export.\n\n"
         "Parameters:\n"
         "- date (required, YYYY-MM-DD): local calendar day to export.\n"
-        "- exclude (optional, list of section names): omit those sections. "
-        f"Allowed sections: {', '.join(settings.ALL_SECTIONS)}. Default: all sections included.\n\n"
-        "Returns: { file_path, json_path, sections_included, tweet_count, "
-        "interaction_count, session_count, search_count, byte_size, content, truncated }. "
-        "If truncated=true, 'content' is empty and the caller should read file_path "
-        "directly (the file on disk is always complete)."
+        "- exclude (optional, list of section names): omit those sections from both "
+        f"markdown and JSON. Allowed: {', '.join(settings.ALL_SECTIONS)}. Default: all included.\n\n"
+        "Returns: { dir_path, digest_path, tweets_path, activity_path, timeline_path, "
+        "json_path, schema_path, sections_included, tweet_count, interaction_count, "
+        "session_count, search_count, byte_size_digest, byte_size_total_md, content, "
+        "truncated }. 'content' inlines digest.md when it fits under the size cap; "
+        "otherwise read digest_path from disk."
     ),
 )
 def export_day(date: str, exclude: list[str] | None = None) -> dict:
@@ -103,11 +116,12 @@ def export_day(date: str, exclude: list[str] | None = None) -> dict:
     name="daily_summary_json",
     description=(
         "Return the structured JSON companion for one day's activity — the same data "
-        "as export_day.md but as parseable JSON. Agents should prefer this over regex-"
-        "ing markdown.\n\n"
-        "Sections: summary, anomalies, tweets_ranked, topics, authors, sessions, "
-        "interactions, searches, link_outs, selections, media.\n\n"
-        "The JSON is ALSO written to disk at exports/YYYY-MM-DD.json whenever "
+        "as the digest/tweets/activity/timeline markdown files but as parseable JSON. "
+        "Agents should prefer this over regex-ing markdown.\n\n"
+        "Sections: summary, anomalies, tweets_ranked, repeat_exposure, topics, authors, "
+        "sessions, interactions, searches, link_outs, selections, media, threads, "
+        "impressions, revisits, timeline.\n\n"
+        "The JSON is also written to disk at exports/YYYY-MM-DD/data.json whenever "
         "export_day is called, so this tool just re-returns it."
     ),
 )

@@ -266,68 +266,6 @@ def render_threads(rows: list[dict], tz: ZoneInfo) -> str:
     return "\n".join(out)
 
 
-def render_impressions(
-    rows: list[dict],
-    tz: ZoneInfo,
-    revisits: dict[tuple[str, str], int] | None = None,
-) -> str:
-    if not rows:
-        return "## Impressions\n\n_none_\n\n"
-    revisits = revisits or {}
-    # Collapse duplicate rows per (session, tweet_id) so the section is readable
-    # — we keep the first row and decorate with ×N where N > 1. Duplicates are
-    # still visible in the raw `impressions` table and in the timeline.
-    seen: set[tuple[str | None, str | None]] = set()
-    deduped: list[dict] = []
-    for r in rows:
-        key = (r.get("session_id"), r.get("tweet_id"))
-        if key in seen:
-            continue
-        seen.add(key)
-        deduped.append(r)
-    out = ["## Impressions", ""]
-    current_key: tuple[str | None, str | None] | None = None
-    session_idx: dict[str | None, int] = {}
-    for r in deduped:
-        key = (r.get("session_id"), r.get("feed_source"))
-        if key != current_key:
-            sid = r.get("session_id")
-            if sid not in session_idx:
-                session_idx[sid] = len(session_idx) + 1
-            idx = session_idx[sid]
-            feed = r.get("feed_source") or "unknown"
-            out.append(f"### Session {idx} · {feed}")
-            out.append("")
-            current_key = key
-        handle = r.get("handle") or ""
-        tid = r.get("tweet_id") or ""
-        url = _tweet_url(handle, tid)
-        text = _clean_text(r.get("text")).strip()
-        revisit_count = revisits.get((r.get("session_id"), r.get("tweet_id")), 0)
-        revisit_suffix = f" · **×{revisit_count}** (revisited)" if revisit_count > 1 else ""
-        eng_bits = []
-        if r.get("likes") is not None:
-            eng_bits.append(f"likes: {_fmt_count(r.get('likes'))}")
-        if r.get("retweets") is not None:
-            eng_bits.append(f"retweets: {_fmt_count(r.get('retweets'))}")
-        if r.get("replies") is not None:
-            eng_bits.append(f"replies: {_fmt_count(r.get('replies'))}")
-        if r.get("views"):
-            eng_bits.append(f"views: {_fmt_count(r.get('views'))}")
-        out.append(
-            f"**@{handle}** · {_local_time(r.get('first_seen_at'), tz)} · "
-            f"dwell {_fmt_dwell_ms(r.get('dwell_ms'))}{revisit_suffix} · [link]({url})"
-        )
-        if text:
-            out.append(text)
-        if eng_bits:
-            out.append(f"_{' · '.join(eng_bits)}_")
-        out.append("")
-        out.append("---")
-        out.append("")
-    return "\n".join(out)
-
-
 def render_link_outs(rows: list[dict], tz: ZoneInfo) -> str:
     if not rows:
         return "## Link-outs\n\n_no links clicked_\n\n"
@@ -841,132 +779,135 @@ def render_schema() -> str:
     )
 
 
-def build_markdown(
-    db_path: Path,
-    target_date: date_cls,
-    exclude: list[str] | None = None,
-) -> tuple[str, list[str], dict[str, Any]]:
-    """Build the markdown for a single local calendar day.
+def _fetch_day_bundle(
+    db, target_date: date_cls, day_start: str, day_end: str, tz: ZoneInfo
+) -> dict[str, Any]:
+    """Preload every row set needed by the four markdown builders + JSON
+    builder. Called once per ``write_export`` so each query runs at most
+    once per day, regardless of how many artifacts consume it."""
+    summary_data = queries.summary(db, day_start, day_end)
 
-    Returns (markdown, sections_included, stats) where stats has tweet_count,
-    interaction_count, etc.
-    """
-    exclude = exclude or []
-    unknown = [s for s in exclude if s not in settings.ALL_SECTIONS]
-    if unknown:
-        raise ValueError(f"unknown section(s) in exclude: {unknown}. Allowed: {settings.ALL_SECTIONS}")
-    included = [s for s in settings.ALL_SECTIONS if s not in exclude]
+    raw_unique = queries.unique_tweets_with_engagement(db, day_start, day_end)
+    unique_tweets = _score_tweets(_enrich_with_topics(raw_unique))
 
-    tz = settings.local_tz()
-    day_start, day_end = queries.day_window_utc(target_date, tz)
+    session_rows = queries.sessions_rows(db, day_start, day_end)
+    impression_rows = queries.impressions_rows(db, day_start, day_end)
 
-    db = queries.connect_ro(db_path)
-    try:
-        blocks: list[str] = []
-        blocks.append(f"# Twitter — {target_date.isoformat()}\n")
+    nav_rows = queries.nav_events_rows(db, day_start, day_end)
+    rel_rows = queries.relationship_changes_rows(db, day_start, day_end)
+    nav_by_session: dict[str, list[dict]] = {}
+    for n in nav_rows:
+        nav_by_session.setdefault(n.get("session_id") or "", []).append(n)
+    rel_by_session: dict[str, list[dict]] = {}
+    for rr in rel_rows:
+        rel_by_session.setdefault(rr.get("session_id") or "", []).append(rr)
+
+    tweet_topic_map = {t.get("tweet_id"): t.get("topics") for t in unique_tweets}
+    imp_topics = [
+        (im.get("first_seen_at") or "", tweet_topic_map.get(im.get("tweet_id")) or ["untagged"])
+        for im in impression_rows
+    ]
+    anomaly_hits = anomalies.detect(session_rows, impression_rows, imp_topics, tz)
+
+    return {
+        "target_date": target_date,
+        "day_start": day_start,
+        "day_end": day_end,
+        "tz": tz,
+        "summary": summary_data,
+        "unique_tweets": unique_tweets,
+        "session_rows": session_rows,
+        "impression_rows": impression_rows,
+        "nav_by_session": nav_by_session,
+        "rel_by_session": rel_by_session,
+        "anomaly_hits": anomaly_hits,
+        "tweet_topic_map": tweet_topic_map,
+        "searches": queries.searches_rows(db, day_start, day_end),
+        "interactions": queries.interactions_rows(db, day_start, day_end),
+        "link_clicks": queries.link_clicks_rows(db, day_start, day_end),
+        "text_selections": queries.text_selections_rows(db, day_start, day_end),
+        "media_events": queries.media_events_rows(db, day_start, day_end),
+        "authors": queries.author_context_rows(db, day_start, day_end),
+        "threads": queries.threads_rows(db, day_start, day_end),
+        "timeline": queries.session_timeline(db, day_start, day_end),
+        "revisits": queries.revisits(db, day_start, day_end),
+    }
+
+
+def _file_header(target_date: date_cls, slice_name: str, tz: ZoneInfo) -> str:
+    return (
+        f"# Twitter — {target_date.isoformat()} — {slice_name}\n\n"
+        f"_Generated {datetime.now(tz).isoformat(timespec='seconds')} · "
+        f"Local timezone: {str(tz)}_\n\n"
+    )
+
+
+def build_digest_markdown(bundle: dict, tz: ZoneInfo, included: list[str]) -> str:
+    """The human scan-at-a-glance surface: TL;DR, Summary, Topics, Authors,
+    Threads. Answers 'what happened yesterday' without pagination."""
+    blocks = [_file_header(bundle["target_date"], "digest", tz)]
+    if "tldr" in included:
         blocks.append(
-            f"_Generated {datetime.now(tz).isoformat(timespec='seconds')} · Local timezone: {str(tz)}_\n"
+            render_tldr(
+                bundle["summary"],
+                bundle["unique_tweets"],
+                bundle["session_rows"],
+                bundle["impression_rows"],
+                tz,
+            )
         )
+    if "summary" in included:
+        blocks.append(render_summary(bundle["summary"], tz))
+    if "topics" in included:
+        blocks.append(render_topics(bundle["unique_tweets"], tz))
+    if "authors" in included:
+        blocks.append(render_authors_v2(bundle["authors"], tz))
+    if "threads" in included:
+        blocks.append(render_threads(bundle["threads"], tz))
+    return "\n".join(blocks)
 
-        # Summary is needed for TL;DR + stats return value, so compute once.
-        summary_data = queries.summary(db, day_start, day_end)
 
-        # Unique-tweet aggregate — input for TL;DR / Tweets-ranked /
-        # Repeat-exposure / Topics. Only fetch when at least one of those
-        # sections will render.
-        needs_unique = any(
-            s in included for s in ("tldr", "tweets_ranked", "repeat_exposure", "topics")
+def build_tweets_markdown(bundle: dict, tz: ZoneInfo, included: list[str]) -> str:
+    """The 'what the feed showed me' surface: ranked + algorithmic pressure."""
+    blocks = [_file_header(bundle["target_date"], "tweets", tz)]
+    if "tweets_ranked" in included:
+        blocks.append(render_tweets_ranked(bundle["unique_tweets"], tz))
+    if "repeat_exposure" in included:
+        blocks.append(render_repeat_exposure(bundle["unique_tweets"], tz))
+    return "\n".join(blocks)
+
+
+def build_activity_markdown(bundle: dict, tz: ZoneInfo, included: list[str]) -> str:
+    """The 'what I did' surface: sessions, searches, interactions, link-outs,
+    text selections, media opens."""
+    blocks = [_file_header(bundle["target_date"], "activity", tz)]
+    if "sessions" in included:
+        blocks.append(
+            render_sessions(
+                bundle["session_rows"], tz,
+                bundle["nav_by_session"], bundle["rel_by_session"],
+            )
         )
-        unique_tweets: list[dict] = []
-        if needs_unique:
-            raw = queries.unique_tweets_with_engagement(db, day_start, day_end)
-            unique_tweets = _score_tweets(_enrich_with_topics(raw))
+    if "searches" in included:
+        blocks.append(render_searches(bundle["searches"], tz))
+    if "interactions" in included:
+        blocks.append(render_interactions(bundle["interactions"], tz))
+    if "link_outs" in included:
+        blocks.append(render_link_outs(bundle["link_clicks"], tz))
+    if "selections" in included:
+        blocks.append(render_selections(bundle["text_selections"], tz))
+    if "media" in included:
+        blocks.append(render_media(bundle["media_events"], tz))
+    return "\n".join(blocks)
 
-        # Sessions are also a TL;DR dependency (anomaly detection).
-        session_rows = queries.sessions_rows(db, day_start, day_end)
-        impression_rows_for_tldr: list[dict] = []
-        if "tldr" in included:
-            impression_rows_for_tldr = queries.impressions_rows(db, day_start, day_end)
 
-        if "tldr" in included:
-            blocks.append(render_tldr(summary_data, unique_tweets, session_rows, impression_rows_for_tldr, tz))
-
-        if "summary" in included:
-            blocks.append(render_summary(summary_data, tz))
-
-        # Preload nav + relationship rows once — used to enrich the sessions
-        # section as well as being standalone timeline inputs.
-        nav_rows = queries.nav_events_rows(db, day_start, day_end)
-        rel_rows = queries.relationship_changes_rows(db, day_start, day_end)
-        nav_by_session: dict[str, list[dict]] = {}
-        for n in nav_rows:
-            nav_by_session.setdefault(n.get("session_id") or "", []).append(n)
-        rel_by_session: dict[str, list[dict]] = {}
-        for rr in rel_rows:
-            rel_by_session.setdefault(rr.get("session_id") or "", []).append(rr)
-
-        if "sessions" in included:
-            blocks.append(render_sessions(session_rows, tz, nav_by_session, rel_by_session))
-
-        if "tweets_ranked" in included:
-            blocks.append(render_tweets_ranked(unique_tweets, tz))
-
-        if "repeat_exposure" in included:
-            blocks.append(render_repeat_exposure(unique_tweets, tz))
-
-        if "topics" in included:
-            blocks.append(render_topics(unique_tweets, tz))
-
-        if "searches" in included:
-            rows = queries.searches_rows(db, day_start, day_end)
-            blocks.append(render_searches(rows, tz))
-
-        if "interactions" in included:
-            rows = queries.interactions_rows(db, day_start, day_end)
-            blocks.append(render_interactions(rows, tz))
-
-        if "link_outs" in included:
-            rows = queries.link_clicks_rows(db, day_start, day_end)
-            blocks.append(render_link_outs(rows, tz))
-
-        if "selections" in included:
-            rows = queries.text_selections_rows(db, day_start, day_end)
-            blocks.append(render_selections(rows, tz))
-
-        if "media" in included:
-            rows = queries.media_events_rows(db, day_start, day_end)
-            blocks.append(render_media(rows, tz))
-
-        if "authors" in included:
-            rows = queries.author_context_rows(db, day_start, day_end)
-            blocks.append(render_authors_v2(rows, tz))
-
-        if "threads" in included:
-            rows = queries.threads_rows(db, day_start, day_end)
-            blocks.append(render_threads(rows, tz))
-
-        if "timeline" in included:
-            rows = queries.session_timeline(db, day_start, day_end)
-            blocks.append(render_timeline(rows, tz))
-
-        if "impressions" in included:
-            rows = queries.impressions_rows(db, day_start, day_end)
-            revisits = queries.revisits(db, day_start, day_end)
-            blocks.append(render_impressions(rows, tz, revisits))
-
-        if "schema" in included:
-            blocks.append(render_schema())
-
-        stats = {
-            "tweet_count": summary_data.get("tweets_seen", 0),
-            "interaction_count": sum((summary_data.get("interactions") or {}).values()),
-            "session_count": summary_data.get("sessions", 0),
-            "search_count": summary_data.get("searches", 0),
-        }
-        markdown = "\n".join(blocks)
-        return markdown, included, stats
-    finally:
-        db.close()
+def build_timeline_markdown(bundle: dict, tz: ZoneInfo, included: list[str]) -> str:
+    """The chronological deep-dive surface. One file — one long stream per
+    session — so an agent can reconstruct the user's journey linearly."""
+    blocks = [_file_header(bundle["target_date"], "timeline", tz)]
+    if "timeline" in included:
+        blocks.append(render_timeline(bundle["timeline"], tz))
+    return "\n".join(blocks)
 
 
 def _eng_from_row(r: dict) -> dict:
@@ -978,204 +919,273 @@ def _eng_from_row(r: dict) -> dict:
     }
 
 
+def build_json_from_bundle(bundle: dict) -> dict[str, Any]:
+    """Build the structured JSON companion from a preloaded bundle. The shape
+    is flat arrays with stable keys; fields only present in some tables use
+    ``null`` when not applicable. Agents should prefer this over re-parsing
+    markdown."""
+    tz = bundle["tz"]
+    target_date = bundle["target_date"]
+    summary_data = bundle["summary"]
+    unique_tweets = bundle["unique_tweets"]
+    session_rows = bundle["session_rows"]
+    impression_rows = bundle["impression_rows"]
+
+    # Tweets ranked (sorted by importance DESC, same rule as the md section)
+    tweets_ranked = sorted(
+        _stub_free(unique_tweets),
+        key=lambda t: (
+            -(t.get("importance") or 0),
+            -(t.get("impressions_count") or 0),
+            -(t.get("views") or 0),
+        ),
+    )
+    tweets_ranked_out = [
+        {
+            "rank": rank,
+            "tweet_id": t.get("tweet_id"),
+            "importance": t.get("importance"),
+            "handle": t.get("handle"),
+            "display_name": t.get("display_name"),
+            "verified": bool(t.get("verified")) if t.get("verified") is not None else None,
+            "text": _clean_text(t.get("text")),
+            "created_at": t.get("created_at"),
+            "conversation_id": t.get("conversation_id"),
+            "quoted_tweet_id": t.get("quoted_tweet_id"),
+            "retweeted_tweet_id": t.get("retweeted_tweet_id"),
+            "reply_to_tweet_id": t.get("reply_to_tweet_id"),
+            "has_media": _has_media(t.get("media_json")),
+            "media_json": t.get("media_json"),
+            "impressions_count": t.get("impressions_count") or 0,
+            "total_dwell_ms": t.get("total_dwell_ms") or 0,
+            "sessions_hit": [
+                s for s in (t.get("sessions_hit_csv") or "").split(",") if s
+            ],
+            "engagement": _eng_from_row(t),
+            "topics": t.get("topics") or [],
+            "user_had_interaction": bool(t.get("user_had_interaction")),
+            "first_seen_at": t.get("first_seen_at"),
+        }
+        for rank, t in enumerate(tweets_ranked, 1)
+    ]
+
+    # Repeat-exposure subset — tweets the feed pushed ≥3×
+    repeat_exposure_out = [
+        t for t in tweets_ranked_out
+        if (t.get("impressions_count") or 0) >= 3
+    ]
+
+    # Topic rollup
+    buckets: dict[str, list[dict]] = {}
+    for t in _stub_free(unique_tweets):
+        for tag in t.get("topics") or ["untagged"]:
+            buckets.setdefault(tag, []).append(t)
+    topics_out = [
+        {
+            "name": tag,
+            "tweet_count": len(tws),
+            "total_dwell_ms": sum(t.get("total_dwell_ms") or 0 for t in tws),
+            "notable_handles": [
+                t.get("handle")
+                for t in sorted(
+                    tws,
+                    key=lambda t: -(t.get("total_dwell_ms") or 0)
+                    - (t.get("impressions_count") or 0),
+                )[:4]
+                if t.get("handle")
+            ],
+        }
+        for tag, tws in sorted(
+            buckets.items(),
+            key=lambda kv: (kv[0] == "untagged", -len(kv[1]), kv[0]),
+        )
+    ]
+
+    interactions_out = [
+        {
+            "tweet_id": r.get("tweet_id"),
+            "action": r.get("action"),
+            "timestamp": r.get("timestamp"),
+            "handle": r.get("handle"),
+            "text_preview": _preview(r.get("text"), 80),
+        }
+        for r in bundle["interactions"]
+    ]
+
+    sessions_out = [
+        {
+            "session_id": r.get("session_id"),
+            "started_at": r.get("started_at"),
+            "ended_at": r.get("ended_at"),
+            "tweet_count": r.get("tweet_count") or 0,
+            "total_dwell_ms": r.get("total_dwell_ms") or 0,
+            "feeds_visited": _parse_json_list(r.get("feeds_visited")),
+        }
+        for r in session_rows
+    ]
+
+    authors_out = [
+        {
+            "handle": r.get("handle"),
+            "user_id": r.get("user_id"),
+            "display_name": r.get("display_name"),
+            "verified": bool(r.get("verified")) if r.get("verified") is not None else None,
+            "follower_count": r.get("follower_count"),
+            "impressions_count": r.get("impressions_count") or 0,
+            "unique_tweets": r.get("unique_tweets") or 0,
+            "total_dwell_ms": r.get("total_dwell_ms") or 0,
+        }
+        for r in bundle["authors"]
+    ]
+
+    link_outs = [
+        {
+            "url": r.get("url"),
+            "domain": r.get("domain"),
+            "link_kind": r.get("link_kind"),
+            "modifiers": r.get("modifiers"),
+            "timestamp": r.get("timestamp"),
+            "tweet_id": r.get("tweet_id"),
+            "handle": r.get("handle"),
+        }
+        for r in bundle["link_clicks"]
+    ]
+
+    selections = [
+        {
+            "tweet_id": r.get("tweet_id"),
+            "text": r.get("text"),
+            "via": r.get("via"),
+            "timestamp": r.get("timestamp"),
+            "handle": r.get("handle"),
+        }
+        for r in bundle["text_selections"]
+    ]
+
+    media = [
+        {
+            "tweet_id": r.get("tweet_id"),
+            "media_kind": r.get("media_kind"),
+            "media_index": r.get("media_index"),
+            "timestamp": r.get("timestamp"),
+            "handle": r.get("handle"),
+        }
+        for r in bundle["media_events"]
+    ]
+
+    searches = [
+        {
+            "query": r.get("query"),
+            "timestamp": r.get("timestamp"),
+            "session_id": r.get("session_id"),
+        }
+        for r in bundle["searches"]
+    ]
+
+    # Threads — grouped by conversation so agents see the full chain.
+    thread_groups: dict[str, list[dict]] = {}
+    for r in bundle["threads"]:
+        thread_groups.setdefault(r["conversation_id"], []).append(r)
+    threads_out = [
+        {
+            "conversation_id": conv_id,
+            "tweet_count": len(items),
+            "tweets": [
+                {
+                    "tweet_id": it.get("tweet_id"),
+                    "handle": it.get("handle"),
+                    "created_at": it.get("created_at"),
+                    "text": _clean_text(it.get("text")),
+                }
+                for it in items
+            ],
+        }
+        for conv_id, items in thread_groups.items()
+    ]
+
+    # Impressions — raw per-impression rows. Not in markdown anymore;
+    # JSON is the sole carrier so agents can reconstruct exact timing.
+    impressions_out = [
+        {
+            "session_id": r.get("session_id"),
+            "tweet_id": r.get("tweet_id"),
+            "handle": r.get("handle"),
+            "feed_source": r.get("feed_source"),
+            "first_seen_at": r.get("first_seen_at"),
+            "dwell_ms": r.get("dwell_ms"),
+            "text": _clean_text(r.get("text")),
+            "engagement": _eng_from_row(r),
+        }
+        for r in impression_rows
+    ]
+
+    # Revisits — (session_id, tweet_id) → count, but JSON wants a list.
+    revisits_out = [
+        {"session_id": sid, "tweet_id": tid, "count": count}
+        for (sid, tid), count in (bundle["revisits"] or {}).items()
+    ]
+
+    # Timeline — chronological event stream (payload already JSON-encoded
+    # by the underlying query; parse for the companion so agents don't
+    # need to double-decode).
+    timeline_out = []
+    for r in bundle["timeline"]:
+        payload = r.get("payload") or "{}"
+        try:
+            payload_parsed = json.loads(payload)
+        except (TypeError, ValueError):
+            payload_parsed = {}
+        timeline_out.append({
+            "session_id": r.get("session_id"),
+            "ts": r.get("ts"),
+            "kind": r.get("kind"),
+            "payload": payload_parsed,
+        })
+
+    return {
+        "date": target_date.isoformat(),
+        "generated_at": datetime.now(tz).isoformat(timespec="seconds"),
+        "timezone": str(tz),
+        "summary": {
+            "sessions": summary_data.get("sessions", 0),
+            "impressions": summary_data.get("tweets_seen", 0),
+            "unique_tweets": summary_data.get("unique_tweets", 0),
+            "unique_authors": summary_data.get("unique_authors", 0),
+            "total_dwell_ms": summary_data.get("total_dwell_ms", 0),
+            "searches": summary_data.get("searches", 0),
+            "interactions_by_action": summary_data.get("interactions") or {},
+        },
+        "anomalies": bundle["anomaly_hits"],
+        "tweets_ranked": tweets_ranked_out,
+        "repeat_exposure": repeat_exposure_out,
+        "topics": topics_out,
+        "authors": authors_out,
+        "sessions": sessions_out,
+        "interactions": interactions_out,
+        "searches": searches,
+        "link_outs": link_outs,
+        "selections": selections,
+        "media": media,
+        "threads": threads_out,
+        "impressions": impressions_out,
+        "revisits": revisits_out,
+        "timeline": timeline_out,
+    }
+
+
 def build_json(
     db_path: Path,
     target_date: date_cls,
 ) -> dict[str, Any]:
-    """Structured companion to build_markdown. Same data, machine-parseable.
-
-    Agents should prefer this over regex-ing the markdown. Shape is flat
-    arrays with stable keys. Fields that only appear in certain tables
-    (e.g., quoted_tweet_id, verified) are always present in the row with
-    ``null`` when not applicable.
-    """
+    """Backward-compatible wrapper — opens a read-only DB handle, builds the
+    bundle, delegates to ``build_json_from_bundle``. Prefer the bundle-based
+    path when you already have one open."""
     tz = settings.local_tz()
     day_start, day_end = queries.day_window_utc(target_date, tz)
     db = queries.connect_ro(db_path)
     try:
-        summary_data = queries.summary(db, day_start, day_end)
-        raw_unique = queries.unique_tweets_with_engagement(db, day_start, day_end)
-        unique_tweets = _score_tweets(_enrich_with_topics(raw_unique))
-        session_rows = queries.sessions_rows(db, day_start, day_end)
-        impression_rows = queries.impressions_rows(db, day_start, day_end)
-
-        # Tweets ranked (sorted by importance DESC, same rule as the md section)
-        tweets_ranked = sorted(
-            _stub_free(unique_tweets),
-            key=lambda t: (
-                -(t.get("importance") or 0),
-                -(t.get("impressions_count") or 0),
-                -(t.get("views") or 0),
-            ),
-        )
-        tweets_ranked_out = [
-            {
-                "rank": rank,
-                "tweet_id": t.get("tweet_id"),
-                "importance": t.get("importance"),
-                "handle": t.get("handle"),
-                "display_name": t.get("display_name"),
-                "verified": bool(t.get("verified")) if t.get("verified") is not None else None,
-                "text": _clean_text(t.get("text")),
-                "created_at": t.get("created_at"),
-                "conversation_id": t.get("conversation_id"),
-                "quoted_tweet_id": t.get("quoted_tweet_id"),
-                "retweeted_tweet_id": t.get("retweeted_tweet_id"),
-                "reply_to_tweet_id": t.get("reply_to_tweet_id"),
-                "has_media": _has_media(t.get("media_json")),
-                "media_json": t.get("media_json"),
-                "impressions_count": t.get("impressions_count") or 0,
-                "total_dwell_ms": t.get("total_dwell_ms") or 0,
-                "sessions_hit": [
-                    s for s in (t.get("sessions_hit_csv") or "").split(",") if s
-                ],
-                "engagement": _eng_from_row(t),
-                "topics": t.get("topics") or [],
-                "user_had_interaction": bool(t.get("user_had_interaction")),
-                "first_seen_at": t.get("first_seen_at"),
-            }
-            for rank, t in enumerate(tweets_ranked, 1)
-        ]
-
-        # Topic rollup
-        buckets: dict[str, list[dict]] = {}
-        for t in _stub_free(unique_tweets):
-            for tag in t.get("topics") or ["untagged"]:
-                buckets.setdefault(tag, []).append(t)
-        topics_out = [
-            {
-                "name": tag,
-                "tweet_count": len(tws),
-                "total_dwell_ms": sum(t.get("total_dwell_ms") or 0 for t in tws),
-                "notable_handles": [
-                    t.get("handle")
-                    for t in sorted(
-                        tws,
-                        key=lambda t: -(t.get("total_dwell_ms") or 0)
-                        - (t.get("impressions_count") or 0),
-                    )[:4]
-                    if t.get("handle")
-                ],
-            }
-            for tag, tws in sorted(
-                buckets.items(),
-                key=lambda kv: (kv[0] == "untagged", -len(kv[1]), kv[0]),
-            )
-        ]
-
-        # Anomalies (same function as render_tldr)
-        tweet_topic_map = {t.get("tweet_id"): t.get("topics") for t in unique_tweets}
-        imp_topics = [
-            (im.get("first_seen_at") or "", tweet_topic_map.get(im.get("tweet_id")) or ["untagged"])
-            for im in impression_rows
-        ]
-        anomaly_hits = anomalies.detect(session_rows, impression_rows, imp_topics, tz)
-
-        interactions_out = [
-            {
-                "tweet_id": r.get("tweet_id"),
-                "action": r.get("action"),
-                "timestamp": r.get("timestamp"),
-                "handle": r.get("handle"),
-                "text_preview": _preview(r.get("text"), 80),
-            }
-            for r in queries.interactions_rows(db, day_start, day_end)
-        ]
-
-        sessions_out = [
-            {
-                "session_id": r.get("session_id"),
-                "started_at": r.get("started_at"),
-                "ended_at": r.get("ended_at"),
-                "tweet_count": r.get("tweet_count") or 0,
-                "total_dwell_ms": r.get("total_dwell_ms") or 0,
-                "feeds_visited": _parse_json_list(r.get("feeds_visited")),
-            }
-            for r in session_rows
-        ]
-
-        authors_out = [
-            {
-                "handle": r.get("handle"),
-                "user_id": r.get("user_id"),
-                "display_name": r.get("display_name"),
-                "verified": bool(r.get("verified")) if r.get("verified") is not None else None,
-                "follower_count": r.get("follower_count"),
-                "impressions_count": r.get("impressions_count") or 0,
-                "unique_tweets": r.get("unique_tweets") or 0,
-                "total_dwell_ms": r.get("total_dwell_ms") or 0,
-            }
-            for r in queries.author_context_rows(db, day_start, day_end)
-        ]
-
-        link_outs = [
-            {
-                "url": r.get("url"),
-                "domain": r.get("domain"),
-                "link_kind": r.get("link_kind"),
-                "modifiers": r.get("modifiers"),
-                "timestamp": r.get("timestamp"),
-                "tweet_id": r.get("tweet_id"),
-                "handle": r.get("handle"),
-            }
-            for r in queries.link_clicks_rows(db, day_start, day_end)
-        ]
-
-        selections = [
-            {
-                "tweet_id": r.get("tweet_id"),
-                "text": r.get("text"),
-                "via": r.get("via"),
-                "timestamp": r.get("timestamp"),
-                "handle": r.get("handle"),
-            }
-            for r in queries.text_selections_rows(db, day_start, day_end)
-        ]
-
-        media = [
-            {
-                "tweet_id": r.get("tweet_id"),
-                "media_kind": r.get("media_kind"),
-                "media_index": r.get("media_index"),
-                "timestamp": r.get("timestamp"),
-                "handle": r.get("handle"),
-            }
-            for r in queries.media_events_rows(db, day_start, day_end)
-        ]
-
-        searches = [
-            {
-                "query": r.get("query"),
-                "timestamp": r.get("timestamp"),
-                "session_id": r.get("session_id"),
-            }
-            for r in queries.searches_rows(db, day_start, day_end)
-        ]
-
-        return {
-            "date": target_date.isoformat(),
-            "generated_at": datetime.now(tz).isoformat(timespec="seconds"),
-            "timezone": str(tz),
-            "summary": {
-                "sessions": summary_data.get("sessions", 0),
-                "impressions": summary_data.get("tweets_seen", 0),
-                "unique_tweets": summary_data.get("unique_tweets", 0),
-                "unique_authors": summary_data.get("unique_authors", 0),
-                "total_dwell_ms": summary_data.get("total_dwell_ms", 0),
-                "searches": summary_data.get("searches", 0),
-                "interactions_by_action": summary_data.get("interactions") or {},
-            },
-            "anomalies": anomaly_hits,
-            "tweets_ranked": tweets_ranked_out,
-            "topics": topics_out,
-            "authors": authors_out,
-            "sessions": sessions_out,
-            "interactions": interactions_out,
-            "searches": searches,
-            "link_outs": link_outs,
-            "selections": selections,
-            "media": media,
-        }
+        bundle = _fetch_day_bundle(db, target_date, day_start, day_end, tz)
+        return build_json_from_bundle(bundle)
     finally:
         db.close()
 
@@ -1195,33 +1205,133 @@ def write_export(
     target_date: date_cls,
     exclude: list[str] | None = None,
 ) -> dict[str, Any]:
+    """Write one local day's export into a per-day directory.
+
+    Layout written to ``settings.EXPORTS_DIR``::
+
+        SCHEMA.md                     # shared, written once
+        YYYY-MM-DD/
+            digest.md                 # TL;DR + summary + topics + authors + threads
+            tweets.md                 # tweets_ranked + repeat_exposure
+            activity.md               # sessions + searches + interactions + link_outs + selections + media
+            timeline.md               # chronological event stream per session
+            data.json                 # complete structured companion
+
+    Any legacy flat files (``YYYY-MM-DD.md`` / ``YYYY-MM-DD.json``) at the
+    exports root are deleted after a successful write — data is fully
+    regenerable from the DB, so the old artifacts carry no unique state.
+    """
+    exclude = exclude or []
+    unknown = [s for s in exclude if s not in settings.ALL_SECTIONS]
+    if unknown:
+        raise ValueError(
+            f"unknown section(s) in exclude: {unknown}. "
+            f"Allowed: {settings.ALL_SECTIONS}"
+        )
+    included = [s for s in settings.ALL_SECTIONS if s not in exclude]
+
     settings.ensure_exports_dir()
-    markdown, included, stats = build_markdown(db_path, target_date, exclude)
+    day_dir = settings.EXPORTS_DIR / target_date.isoformat()
+    day_dir.mkdir(parents=True, exist_ok=True, mode=0o755)
 
-    md_path = settings.EXPORTS_DIR / f"{target_date.isoformat()}.md"
-    md_path.write_text(markdown, encoding="utf-8")
+    schema_path = settings.EXPORTS_DIR / "SCHEMA.md"
+    if not schema_path.exists():
+        schema_path.write_text(render_schema(), encoding="utf-8")
 
-    # JSON companion — always written alongside the markdown. Ignores
-    # ``exclude`` (the JSON is structural, not presentational, so callers
-    # that want a subset should filter keys themselves).
-    json_data = build_json(db_path, target_date)
-    json_path = settings.EXPORTS_DIR / f"{target_date.isoformat()}.json"
+    tz = settings.local_tz()
+    day_start, day_end = queries.day_window_utc(target_date, tz)
+
+    db = queries.connect_ro(db_path)
+    try:
+        bundle = _fetch_day_bundle(db, target_date, day_start, day_end, tz)
+    finally:
+        db.close()
+
+    digest_md = build_digest_markdown(bundle, tz, included)
+    tweets_md = build_tweets_markdown(bundle, tz, included)
+    activity_md = build_activity_markdown(bundle, tz, included)
+    timeline_md = build_timeline_markdown(bundle, tz, included)
+
+    # Filter JSON keys by ``exclude`` — the JSON is the one place raw
+    # impressions still live, so excluding ``impressions`` actually means
+    # "drop the impressions key from data.json".
+    json_data = build_json_from_bundle(bundle)
+    json_to_key = {
+        "impressions": "impressions",
+        "threads": "threads",
+        "timeline": "timeline",
+        "link_outs": "link_outs",
+        "selections": "selections",
+        "media": "media",
+        "searches": "searches",
+        "interactions": "interactions",
+        "repeat_exposure": "repeat_exposure",
+        "topics": "topics",
+        "authors": "authors",
+        "sessions": "sessions",
+        "tweets_ranked": "tweets_ranked",
+    }
+    for sec in exclude:
+        k = json_to_key.get(sec)
+        if k and k in json_data:
+            json_data.pop(k, None)
+
+    digest_path = day_dir / "digest.md"
+    tweets_path = day_dir / "tweets.md"
+    activity_path = day_dir / "activity.md"
+    timeline_path = day_dir / "timeline.md"
+    json_path = day_dir / "data.json"
+
+    digest_path.write_text(digest_md, encoding="utf-8")
+    tweets_path.write_text(tweets_md, encoding="utf-8")
+    activity_path.write_text(activity_md, encoding="utf-8")
+    timeline_path.write_text(timeline_md, encoding="utf-8")
     json_path.write_text(
         json.dumps(json_data, indent=2, ensure_ascii=False, default=str),
         encoding="utf-8",
     )
 
-    byte_size = len(markdown.encode("utf-8"))
-    truncated = byte_size > settings.INLINE_CONTENT_CAP_BYTES
+    # Clean up legacy flat-file layout (previous export format). Only
+    # runs after all new writes succeeded.
+    for legacy in (
+        settings.EXPORTS_DIR / f"{target_date.isoformat()}.md",
+        settings.EXPORTS_DIR / f"{target_date.isoformat()}.json",
+    ):
+        if legacy.is_file():
+            legacy.unlink()
+
+    summary_data = bundle["summary"]
+    stats = {
+        "tweet_count": summary_data.get("tweets_seen", 0),
+        "interaction_count": sum((summary_data.get("interactions") or {}).values()),
+        "session_count": summary_data.get("sessions", 0),
+        "search_count": summary_data.get("searches", 0),
+    }
+
+    byte_size_digest = len(digest_md.encode("utf-8"))
+    byte_size_total_md = (
+        byte_size_digest
+        + len(tweets_md.encode("utf-8"))
+        + len(activity_md.encode("utf-8"))
+        + len(timeline_md.encode("utf-8"))
+    )
+    truncated = byte_size_digest > settings.INLINE_CONTENT_CAP_BYTES
+
     return {
-        "file_path": str(md_path),
+        "dir_path": str(day_dir),
+        "digest_path": str(digest_path),
+        "tweets_path": str(tweets_path),
+        "activity_path": str(activity_path),
+        "timeline_path": str(timeline_path),
         "json_path": str(json_path),
+        "schema_path": str(schema_path),
         "sections_included": included,
         "tweet_count": stats["tweet_count"],
         "interaction_count": stats["interaction_count"],
         "session_count": stats["session_count"],
         "search_count": stats["search_count"],
-        "byte_size": byte_size,
-        "content": "" if truncated else markdown,
+        "byte_size_digest": byte_size_digest,
+        "byte_size_total_md": byte_size_total_md,
+        "content": "" if truncated else digest_md,
         "truncated": truncated,
     }

@@ -183,16 +183,23 @@ async def export_day(request: Request, date: str | None = None):
         raise HTTPException(status_code=404, detail="database not found — nothing to export")
 
     result = mcp_export.write_export(mcp_settings.DB_PATH, target, [])
-    # Trim the inline markdown from the response — the extension just needs
-    # the file path. The file on disk is always complete.
+    # Trim the inline markdown from the response — callers just need the
+    # paths. The files on disk are always complete.
     return {
-        "file_path": result["file_path"],
+        "dir_path": result["dir_path"],
+        "digest_path": result["digest_path"],
+        "tweets_path": result["tweets_path"],
+        "activity_path": result["activity_path"],
+        "timeline_path": result["timeline_path"],
+        "json_path": result["json_path"],
+        "schema_path": result["schema_path"],
         "date": target.isoformat(),
         "tweet_count": result["tweet_count"],
         "interaction_count": result["interaction_count"],
         "session_count": result["session_count"],
         "search_count": result["search_count"],
-        "byte_size": result["byte_size"],
+        "byte_size_digest": result["byte_size_digest"],
+        "byte_size_total_md": result["byte_size_total_md"],
     }
 
 

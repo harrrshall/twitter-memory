@@ -5,7 +5,9 @@ v2 work: TL;DR digest, Tweets-ranked table, Repeat-exposure, Topics,
 Authors-with-context, Schema. Also locks in HTML-entity decoding and
 stub filtering.
 """
+import json
 from datetime import date
+from pathlib import Path
 
 import pytest
 
@@ -13,6 +15,10 @@ from tests.fixtures import home_timeline_payload, make_tweet, make_user
 
 
 pytestmark = pytest.mark.asyncio
+
+
+def _read(res: dict, key: str) -> str:
+    return Path(res[key]).read_text(encoding="utf-8")
 
 
 async def _seed_heavy_scroll(tmp_data_dir):
@@ -107,19 +113,19 @@ async def test_tldr_headline_and_topic_rollup(tmp_data_dir, monkeypatch):
 
     await _seed_heavy_scroll(tmp_data_dir)
     res = export.write_export(settings.DB_PATH, date(2026, 4, 21))
-    md = res["content"]
+    digest = _read(res, "digest_path")
 
-    assert "## TL;DR" in md
+    assert "## TL;DR" in digest
     # headline: 5 impressions of 4 unique... (stub is filtered only from
     # human-readable; stub might or might not show in unique count depending
     # on whether the stub author row exists)
-    assert "impressions of" in md
+    assert "impressions of" in digest
     # Topic detection: the ai-tooling tweet should surface
-    assert "`ai-tooling`" in md
+    assert "`ai-tooling`" in digest
     # Algorithmic pressure line: t_algo was seen 4 times
-    assert "×4" in md or "×3" in md
+    assert "×4" in digest or "×3" in digest
     # "Actually read" line: two tweets had dwell >= 3s
-    assert "Actually read" in md
+    assert "Actually read" in digest
 
 
 async def test_tweets_ranked_table_structure(tmp_data_dir, monkeypatch):
@@ -132,17 +138,17 @@ async def test_tweets_ranked_table_structure(tmp_data_dir, monkeypatch):
 
     await _seed_heavy_scroll(tmp_data_dir)
     res = export.write_export(settings.DB_PATH, date(2026, 4, 21))
-    md = res["content"]
+    tweets_md = _read(res, "tweets_path")
 
-    assert "## Tweets (ranked by importance)" in md
+    assert "## Tweets (ranked by importance)" in tweets_md
     # Column header row
-    assert "| # | imp | handle |" in md
+    assert "| # | imp | handle |" in tweets_md
     # tid prefix
-    assert "| t2001 |" in md or "| t2004 |" in md
+    assert "| t2001 |" in tweets_md or "| t2004 |" in tweets_md
     # The highly-liked calm tweet should outrank the algo-pushed pressure
     # tweet because of higher dwell + interaction + views percentile.
-    idx_calm = md.find("t2004")
-    idx_algo = md.find("t2001")
+    idx_calm = tweets_md.find("t2004")
+    idx_algo = tweets_md.find("t2001")
     assert idx_calm >= 0 and idx_algo >= 0
     assert idx_calm < idx_algo, "t2004 (read + liked) should rank above t2001 (algo pressure with 0 dwell)"
 
@@ -157,10 +163,10 @@ async def test_repeat_exposure_only_shows_pressured(tmp_data_dir, monkeypatch):
 
     await _seed_heavy_scroll(tmp_data_dir)
     res = export.write_export(settings.DB_PATH, date(2026, 4, 21))
-    md = res["content"]
+    tweets_md = _read(res, "tweets_path")
 
     # Pull out just the repeat-exposure section
-    section = md.split("\n## Repeat-exposure", 1)[1].split("\n## ", 1)[0]
+    section = tweets_md.split("\n## Repeat-exposure", 1)[1]
     assert "@chop" in section         # seen 4× → qualifies
     assert "@bob" not in section       # seen 1× → excluded
     assert "@alice" not in section     # seen 1× → excluded
@@ -177,13 +183,12 @@ async def test_html_entities_decoded(tmp_data_dir, monkeypatch):
 
     await _seed_heavy_scroll(tmp_data_dir)
     res = export.write_export(settings.DB_PATH, date(2026, 4, 21))
-    md = res["content"]
+    # tweets.md is where the entity-laden tweet text surfaces (ranked table)
+    tweets_md = _read(res, "tweets_path")
 
-    # Raw entities should be gone from rendered text
-    assert "&gt;" not in md
-    assert "&amp;" not in md
-    # Decoded text should be present (at least somewhere)
-    assert "> drop them into a doc & ask for tweets" in md
+    assert "&gt;" not in tweets_md
+    assert "&amp;" not in tweets_md
+    assert "> drop them into a doc & ask for tweets" in tweets_md
 
 
 async def test_topics_section_has_untagged_and_known_bucket(tmp_data_dir, monkeypatch):
@@ -196,9 +201,9 @@ async def test_topics_section_has_untagged_and_known_bucket(tmp_data_dir, monkey
 
     await _seed_heavy_scroll(tmp_data_dir)
     res = export.write_export(settings.DB_PATH, date(2026, 4, 21))
-    md = res["content"]
+    digest = _read(res, "digest_path")
 
-    section = md.split("\n## Topics", 1)[1].split("\n## ", 1)[0]
+    section = digest.split("\n## Topics", 1)[1].split("\n## ", 1)[0]
     assert "`ai-tooling`" in section
     # meme tweet: POV / when she
     assert "`meme`" in section
@@ -216,9 +221,9 @@ async def test_authors_section_surfaces_follower_count(tmp_data_dir, monkeypatch
 
     await _seed_heavy_scroll(tmp_data_dir)
     res = export.write_export(settings.DB_PATH, date(2026, 4, 21))
-    md = res["content"]
+    digest = _read(res, "digest_path")
 
-    section = md.split("\n## Authors", 1)[1].split("\n## ", 1)[0]
+    section = digest.split("\n## Authors", 1)[1].split("\n## ", 1)[0]
     # alice has 50k followers configured
     assert "50.0K" in section or "50,000" in section
     # and her verified flag is ✓
@@ -235,15 +240,19 @@ async def test_schema_always_present_and_documents_scoring(tmp_data_dir, monkeyp
 
     await _seed_heavy_scroll(tmp_data_dir)
     res = export.write_export(settings.DB_PATH, date(2026, 4, 21))
-    md = res["content"]
+    # Schema is a shared file at the exports root, not inlined per day.
+    schema_text = Path(res["schema_path"]).read_text(encoding="utf-8")
 
-    assert "## Schema (v2)" in md
-    assert "0.40·dwell_norm" in md
-    assert "tid" in md
-    assert "algorithmic pressure" in md.lower()
+    assert "## Schema (v2)" in schema_text
+    assert "0.40·dwell_norm" in schema_text
+    assert "tid" in schema_text
+    assert "algorithmic pressure" in schema_text.lower()
 
 
-async def test_all_sections_ordered_llm_first(tmp_data_dir, monkeypatch):
+async def test_llm_first_ordering_across_files(tmp_data_dir, monkeypatch):
+    """The high-signal surfaces (TL;DR, Tweets-ranked, Repeat-exposure,
+    Topics) must all be readable without opening timeline.md. Digest +
+    tweets files must contain them; timeline must be its own file."""
     monkeypatch.setenv("TZ", "UTC")
     monkeypatch.setenv("TWITTER_MEMORY_TZ", "UTC")
     import importlib
@@ -253,21 +262,23 @@ async def test_all_sections_ordered_llm_first(tmp_data_dir, monkeypatch):
 
     await _seed_heavy_scroll(tmp_data_dir)
     res = export.write_export(settings.DB_PATH, date(2026, 4, 21))
-    md = res["content"]
+    digest = _read(res, "digest_path")
+    tweets_md = _read(res, "tweets_path")
+    timeline_md = _read(res, "timeline_path")
 
-    # TL;DR must come before the raw Impressions log. That's the whole point.
-    tldr_pos = md.find("## TL;DR")
-    impressions_pos = md.find("## Impressions")
-    assert tldr_pos >= 0 and impressions_pos >= 0
-    assert tldr_pos < impressions_pos
+    assert "## TL;DR" in digest
+    assert "## Topics" in digest
+    assert "## Tweets (ranked by importance)" in tweets_md
+    assert "## Repeat-exposure" in tweets_md
+    # Timeline is its own file, not smuggled into the digest.
+    assert "## Timeline" in timeline_md
+    assert "## Timeline" not in digest
+    # And the raw impressions section is gone from every .md file.
+    for text in (digest, tweets_md, timeline_md):
+        assert "## Impressions" not in text
 
-    # Tweets-ranked + Repeat-exposure + Topics must all come before raw impressions
-    for section in ("## Tweets (ranked by importance)", "## Repeat-exposure", "## Topics"):
-        pos = md.find(section)
-        assert pos > 0 and pos < impressions_pos, f"{section} not before raw Impressions"
 
-
-async def test_stub_tweets_excluded_from_ranked_but_present_in_raw(tmp_data_dir, monkeypatch):
+async def test_stub_tweets_excluded_from_ranked_but_present_in_json(tmp_data_dir, monkeypatch):
     monkeypatch.setenv("TZ", "UTC")
     monkeypatch.setenv("TWITTER_MEMORY_TZ", "UTC")
     import importlib
@@ -277,14 +288,13 @@ async def test_stub_tweets_excluded_from_ranked_but_present_in_raw(tmp_data_dir,
 
     await _seed_heavy_scroll(tmp_data_dir)
     res = export.write_export(settings.DB_PATH, date(2026, 4, 21))
-    md = res["content"]
+    tweets_md = _read(res, "tweets_path")
+    data = json.loads(Path(res["json_path"]).read_text(encoding="utf-8"))
 
     # The stub tweet (id 2099, no author, no text) should:
     # - NOT appear as a row in the Tweets-ranked table
-    # - STILL appear in the raw Impressions section (complete log)
-    ranked_section = md.split("\n## Tweets (ranked by importance)", 1)[1].split("\n## ", 1)[0]
+    # - STILL appear in data.json's raw impressions array so the log stays complete
+    ranked_section = tweets_md.split("\n## Tweets (ranked by importance)", 1)[1].split("\n## ", 1)[0]
     assert "t2099" not in ranked_section
-    # In raw impressions the stub has no handle, so the link uses @i as
-    # fallback; confirm the tweet_id is still there
-    impressions_section = md.split("\n## Impressions", 1)[1].split("\n## ", 1)[0]
-    assert "2099" in impressions_section
+    impression_tids = [im.get("tweet_id") for im in data.get("impressions") or []]
+    assert "2099" in impression_tids

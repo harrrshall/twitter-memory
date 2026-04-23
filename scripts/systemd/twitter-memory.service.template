@@ -4,9 +4,9 @@ After=network.target
 
 [Service]
 Type=simple
-WorkingDirectory=%h/Desktop/attention_is_all_you_need/twitter_memory
-Environment=TWITTER_MEMORY_DATA=%h/Desktop/attention_is_all_you_need/twitter_memory/data
-ExecStart=%h/Desktop/attention_is_all_you_need/twitter_memory/.venv/bin/python -m backend.main
+WorkingDirectory={{REPO}}
+EnvironmentFile={{ENV_FILE}}
+ExecStart={{VENV_PYTHON}} -m backend.main
 Restart=on-failure
 RestartSec=3
 # Logs go to journalctl --user -u twitter-memory -f

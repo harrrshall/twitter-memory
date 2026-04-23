@@ -270,8 +270,10 @@ async def test_export_day_writes_json_companion(tmp_data_dir, monkeypatch):
     await _seed_rich(tmp_data_dir)
     from mcp_server import server, settings
     r = server.export_day(date="2026-04-21")
-    assert Path(r["file_path"]).exists()
-    assert Path(r["json_path"]).exists()
+    # Directory + per-file paths all written
+    assert Path(r["dir_path"]).is_dir()
+    for key in ("digest_path", "tweets_path", "activity_path", "timeline_path", "json_path"):
+        assert Path(r[key]).exists(), f"{key} missing"
     body = json.loads(Path(r["json_path"]).read_text())
     # Mirrors daily_summary_json
     assert body["date"] == "2026-04-21"
