@@ -383,8 +383,9 @@ def session_timeline(db: sqlite3.Connection, day_start: str, day_end: str) -> li
       LEFT JOIN authors a ON rc.target_user_id = a.user_id
       WHERE rc.timestamp >= ? AND rc.timestamp < ?
     )
-    SELECT session_id, ts, kind, payload FROM timeline
-    ORDER BY session_id NULLS LAST, ts, kind
+    SELECT tl.session_id, tl.ts, tl.kind, tl.payload FROM timeline tl
+    LEFT JOIN sessions s ON tl.session_id = s.session_id
+    ORDER BY s.started_at NULLS LAST, tl.ts, tl.kind
     """
     params = (day_start, day_end) * 8
     cur = db.execute(q, params)
