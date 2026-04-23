@@ -35,13 +35,15 @@ def _fmt_count(n: int | None) -> str:
 
 def _fmt_duration_ms(ms: int | None) -> str:
     if not ms or ms <= 0:
-        return "0m"
+        return "0s"
     s = ms // 1000
     h, rem = divmod(s, 3600)
-    m, _ = divmod(rem, 60)
+    m, sec = divmod(rem, 60)
     if h > 0:
         return f"{h}h {m}m"
-    return f"{m}m"
+    if m > 0:
+        return f"{m}m"
+    return f"{sec}s"
 
 
 def _local_time(iso_utc: str | None, tz: ZoneInfo) -> str:
