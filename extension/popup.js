@@ -85,7 +85,7 @@ document.getElementById("export").addEventListener("click", async () => {
     const res = await fetch(`${BACKEND}/export/day`, { method: "POST" });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const body = await res.json();
-    status.textContent = `${body.tweet_count} tweets → ${body.file_path}`;
+    status.textContent = `${body.tweet_count} tweets → ${body.dir_path}`;
   } catch (e) {
     status.textContent = `export failed: ${e.message || e}`;
   } finally {
