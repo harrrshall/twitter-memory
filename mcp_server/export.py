@@ -335,9 +335,17 @@ def render_media(rows: list[dict], tz: ZoneInfo) -> str:
         handle = items[0].get("handle") or ""
         url = _tweet_url(handle, tid) if tid != "(unknown)" else ""
         header = f"- [@{handle}]({url})" if handle and url else f"- tweet {tid}"
+        # Deduplicate: keep only the first observation per (kind, index) pair
+        seen_keys: set[tuple] = set()
+        deduped = []
+        for it in items:
+            key = (it.get("media_kind"), it.get("media_index"))
+            if key not in seen_keys:
+                seen_keys.add(key)
+                deduped.append(it)
         kinds = ", ".join(
             f"{it.get('media_kind','?')}#{it.get('media_index','?')} @ {_local_hm(it.get('timestamp'), tz)}"
-            for it in items
+            for it in deduped
         )
         preview = _preview(items[0].get("text"), 80)
         out.append(f"{header} · {kinds}" + (f" — \"{preview}\"" if preview else ""))
